@@ -22,26 +22,27 @@ No pip install. No virtualenv. No config files. One Python file, standard librar
 ## Quick start
 
 ```bash
-# 1. Set your API key
-export MISTRAL_API_KEY=your_key_here   # or whichever provider you use
+# Set your API key
+export MISTRAL_API_KEY=your_key_here
 
-# 2. Run — three ways:
+# Write both CodebaseDump.md and ReadmeDev.md (default)
+python sumai.py all --root /path/to/your/project
 
-# From the project root (sumai.py lives there)
-cd /your/project && python sumai.py
+# Write CodebaseDump.md only — no AI call, no API key needed
+python sumai.py dump --root /path/to/your/project
 
-# From anywhere, point at a project
-python sumai.py --root /path/to/your/project
+# Write ReadmeDev.md only — AI call, dump not saved to disk
+python sumai.py readme --root /path/to/your/project
 
-# Dump only — no LLM call, just CodebaseDump.md
-python sumai.py --root /path/to/your/project --dump-only
+# --root is optional if sumai.py is already in the project root
+cd /your/project && python sumai.py all
 ```
 
-**Output:**
+**Output per command:**
 ```
-your-project/
-├── CodebaseDump.md     ← full codebase in one file
-└── ReadmeDev.md        ← AI-generated developer reference (with AI warning banner)
+dump   → CodebaseDump.md
+readme → ReadmeDev.md
+all    → CodebaseDump.md + ReadmeDev.md
 ```
 
 ---
@@ -85,15 +86,15 @@ Secrets inside text files are redacted before being sent to the LLM (API keys, t
 
 ---
 
-## Without AI (dump only)
+## Commands
 
-```bash
-# Via CLI flag (recommended)
-python sumai.py --dump-only
+| Command | AI call | CodebaseDump.md | ReadmeDev.md |
+|---|---|---|---|
+| `all` | ✅ | ✅ | ✅ |
+| `dump` | ❌ | ✅ | ❌ |
+| `readme` | ✅ | ❌ | ✅ |
 
-# Or in the config block
-AI_ENABLED = False
-```
+`dump` is useful for pasting the codebase into any AI chat manually, archiving a snapshot, or running without an API key. `readme` is useful when you only want the doc regenerated without overwriting an existing dump.
 
 You still get `CodebaseDump.md` — a clean, structured snapshot of your entire codebase in one markdown file. Useful for:
 

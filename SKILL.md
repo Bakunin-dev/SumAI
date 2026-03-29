@@ -13,14 +13,14 @@ The script runs a two-pass LLM pipeline: a research agent collects grounded tech
 
 ## When to invoke sumai
 
-Invoke `python sumai.py` when the user asks any of the following:
-
-- "generate the documentation" / "update the docs"
-- "create ReadmeDev" / "regenerate ReadmeDev.md"
-- "summarize the codebase" / "dump the codebase"
-- "generate CodebaseDump" / "create a codebase snapshot"
-- "run sumai"
-- Before answering architectural questions, if `ReadmeDev.md` is missing or stale (older than the most recently modified source file)
+| Situation | Command |
+|---|---|
+| User asks to "generate docs" / "update ReadmeDev" | `readme` or `all` |
+| User asks to "dump the codebase" / "create a codebase snapshot" | `dump` |
+| User asks to "run sumai" without specifics | `all` |
+| No API key available but codebase snapshot needed | `dump` |
+| ReadmeDev.md is missing or stale, dump already fresh | `readme` |
+| Fresh start on an unfamiliar project | `all` |
 
 Do **not** invoke sumai for routine coding tasks, file edits, or questions that don't require a full project overview.
 
@@ -29,17 +29,28 @@ Do **not** invoke sumai for routine coding tasks, file edits, or questions that 
 ## How to invoke
 
 ```bash
-# Recommended: set API key via environment variable
 export MISTRAL_API_KEY=your_key_here
 
-# Run from project root (where sumai.py lives)
-python sumai.py
+# Write CodebaseDump.md + ReadmeDev.md
+python sumai.py all --root /path/to/project
+
+# Write CodebaseDump.md only (no AI, no API key needed)
+python sumai.py dump --root /path/to/project
+
+# Write ReadmeDev.md only (AI call, dump not saved)
+python sumai.py readme --root /path/to/project
+
+# --root optional if sumai.py is in the project root
+python sumai.py all
 ```
 
-**Requirements:**
-- Python 3.10+
-- `sumai.py` must be in the project root
-- API key must be set (or `AI_ENABLED = False` in the config block for dump-only mode)
+**Command summary:**
+
+| Command | AI call | Writes CodebaseDump.md | Writes ReadmeDev.md |
+|---|---|---|---|
+| `all` | ✅ | ✅ | ✅ |
+| `dump` | ❌ | ✅ | ❌ |
+| `readme` | ✅ | ❌ | ✅ |
 
 ---
 

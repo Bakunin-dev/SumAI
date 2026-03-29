@@ -15,9 +15,10 @@ Each stage has a dedicated function and the pipeline returns per-stage timings.
 How to use:
 - put this file anywhere (or keep it outside the project)
 - edit the AI CONFIG block near the top
-- run: python sumai.py                        # scan current directory
-- run: python sumai.py --root /path/to/proj   # scan a specific directory
-- run: python sumai.py --dump-only            # skip LLM, write CodebaseDump.md only
+- run: python sumai.py all                        # write CodebaseDump.md + ReadmeDev.md
+- run: python sumai.py dump                       # write CodebaseDump.md only (no AI)
+- run: python sumai.py readme                     # write ReadmeDev.md only (no dump saved)
+- run: python sumai.py [command] --root /path     # scan a specific directory
 """
 
 from __future__ import annotations
@@ -449,6 +450,7 @@ class RuntimeConfig:
     ai_max_output_tokens: int = AI_MAX_OUTPUT_TOKENS
     ai_temperature: float | None = AI_TEMPERATURE
     ai_system_prompt: str = AI_SYSTEM_PROMPT
+    write_dump: bool = True
     simple_ignore_patterns: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -1918,9 +1920,12 @@ def run_pipeline(
     dump = render_dump(config, discovery, inspection)
     record_stage(timings, "render_dump", started, "ok", {"chars": len(dump.text)})
 
-    started = time.perf_counter()
-    atomic_write_text(config.dump_path, dump.text)
-    record_stage(timings, "write_dump", started, "ok", {"path": str(config.dump_path)})
+    if config.write_dump:
+        started = time.perf_counter()
+        atomic_write_text(config.dump_path, dump.text)
+        record_stage(timings, "write_dump", started, "ok", {"path": str(config.dump_path)})
+    else:
+        record_stage(timings, "write_dump", time.perf_counter(), "skipped", {"reason": "write_dump=False"})
 
     if not config.ai_enabled:
         started = time.perf_counter()
@@ -2143,33 +2148,54 @@ def run_pipeline(
     )
 
 
-def parse_args() -> tuple[pathlib.Path, bool]:
-    """Parse CLI arguments. Returns (project_root, dump_only)."""
+COMMANDS = ("all", "dump", "readme")
+
+
+def parse_args() -> tuple[str, pathlib.Path]:
+    """Parse CLI arguments. Returns (command, project_root)."""
     import sys as _sys
     args = _sys.argv[1:]
+    command = "all"
     project_root = PROJECT_ROOT
-    dump_only = False
+
+    # Extract command if first non-flag arg
+    if args and not args[0].startswith("-"):
+        command = args[0].lower()
+        args = args[1:]
+        if command not in COMMANDS:
+            print(
+                f"[sumai] Unknown command: {command!r}. "
+                f"Valid commands: {', '.join(COMMANDS)}. Use --help for usage.",
+                flush=True,
+            )
+            raise SystemExit(1)
+
     i = 0
     while i < len(args):
         arg = args[i]
         if arg in ("--root", "-r"):
             if i + 1 >= len(args):
-                print(f"[sumai] Error: --root requires a path argument", flush=True)
+                print("[sumai] Error: --root requires a path argument", flush=True)
                 raise SystemExit(1)
             project_root = pathlib.Path(args[i + 1]).resolve()
             if not project_root.is_dir():
-                print(f"[sumai] Error: --root path does not exist or is not a directory: {project_root}", flush=True)
+                print(
+                    f"[sumai] Error: --root path does not exist or is not a directory: {project_root}",
+                    flush=True,
+                )
                 raise SystemExit(1)
             i += 2
-        elif arg in ("--dump-only", "-d"):
-            dump_only = True
-            i += 1
         elif arg in ("--help", "-h"):
             print(
-                "Usage: python sumai.py [--root PATH] [--dump-only]\n"
+                "Usage: python sumai.py [command] [--root PATH]\n"
                 "\n"
+                "Commands:\n"
+                "  all     Write CodebaseDump.md and ReadmeDev.md (default)\n"
+                "  dump    Write CodebaseDump.md only — no AI call\n"
+                "  readme  Write ReadmeDev.md only — AI call, dump not saved\n"
+                "\n"
+                "Options:\n"
                 "  --root PATH, -r PATH   Project root to scan (default: directory of sumai.py)\n"
-                "  --dump-only, -d        Skip LLM call, write CodebaseDump.md only\n"
                 "  --help, -h             Show this message\n",
                 flush=True,
             )
@@ -2177,21 +2203,29 @@ def parse_args() -> tuple[pathlib.Path, bool]:
         else:
             print(f"[sumai] Unknown argument: {arg!r}. Use --help for usage.", flush=True)
             raise SystemExit(1)
-    return project_root, dump_only
+    return command, project_root
 
 
 def main() -> int:
-    project_root, dump_only = parse_args()
+    command, project_root = parse_args()
     config = build_runtime_config(project_root=project_root)
-    if dump_only:
-        from dataclasses import replace as _replace
-        config = _replace(config, ai_enabled=False)
+
+    if command == "dump":
+        config = replace(config, ai_enabled=False, write_dump=True)
+    elif command == "readme":
+        config = replace(config, ai_enabled=True, write_dump=False)
+    else:  # "all"
+        config = replace(config, ai_enabled=True, write_dump=True)
+
     result = run_pipeline(config=config, logger=log)
     if config.artifact_dir.exists():
         shutil.rmtree(config.artifact_dir)
+
     if result.return_code == 0:
-        if dump_only:
-            log(f"[sumai] Done. Wrote {config.dump_name} (dump-only mode, AI skipped).")
+        if command == "dump":
+            log(f"[sumai] Done. Wrote {config.dump_name}.")
+        elif command == "readme":
+            log(f"[sumai] Done. Wrote {config.readme_name}.")
         else:
             log(f"[sumai] Done. Wrote {config.dump_name} and {config.readme_name}.")
     else:
