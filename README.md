@@ -47,28 +47,54 @@ all    → CodebaseDump.md + ReadmeDev.md
 
 ---
 
-## Supported providers
+## AI Model Router
 
-Edit the `AI CONFIG` block at the top of `sumai.py`:
+sumai uses a typed preset system. Most users only need one line:
 
 ```python
-# Mistral (default) — set MISTRAL_API_KEY env var
-AI_PROTOCOL = "chat_completions"
-AI_BASE_URL  = "https://api.mistral.ai/v1"
-AI_MODEL     = "mistral-small-2603"
-
-# OpenAI — set OPENAI_API_KEY env var
-AI_PROTOCOL = "responses"
-AI_BASE_URL  = "https://api.openai.com/v1"
-AI_MODEL     = "gpt-4o-mini"
-
-# Z.ai GLM — set ZAI_API_KEY env var
-AI_PROTOCOL = "chat_completions"
-AI_BASE_URL  = "https://api.z.ai/api/paas/v4"
-AI_MODEL     = "glm-4.7-flash"
+# Choose a preset (default: mistral_small)
+AI_MODEL_PRESET = "mistral_small"
 ```
 
-Most OpenAI-compatible APIs should work. Set `AI_ENABLED = False` to skip the LLM call and only generate `CodebaseDump.md`.
+### Built-in presets
+
+| Preset | Provider | Protocol | Model |
+|--------|----------|----------|-------|
+| `mistral_small` | Mistral | chat_completions | mistral-small-2603 |
+| `glm_flash` | Z.ai | chat_completions | glm-4.7-flash |
+| `openai_gpt5` | OpenAI | responses | gpt-5 |
+
+### Add your own model
+
+One entry in `MODEL_REGISTRY`:
+
+```python
+MODEL_REGISTRY["my_model"] = ModelSpec(
+    provider_name="my_model",
+    protocol="chat_completions",        # or "responses"
+    base_url="https://api.example.com/v1",
+    model="my-model-name",
+    env_keys=("MY_API_KEY", "AI_API_KEY"),
+)
+```
+
+Then set:
+```python
+AI_MODEL_PRESET = "my_model"
+```
+
+### Override mode (for fine-tuning)
+
+Override any preset value without changing the registry:
+
+```python
+AI_MODEL_PRESET = "mistral_small"
+AI_MODEL_OVERRIDE = "mistral-small-latest"  # use different model
+AI_BASE_URL_OVERRIDE = "https://my-proxy.com/v1"  # custom endpoint
+AI_API_KEY_OVERRIDE = "sk-..."  # hardcoded key (not recommended)
+```
+
+Set `AI_ENABLED = False` to skip the LLM call and only generate `CodebaseDump.md`.
 
 ---
 

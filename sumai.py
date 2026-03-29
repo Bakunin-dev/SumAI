@@ -37,42 +37,27 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Callable
+from typing import Any, Callable, Literal, cast
 
 # ============================================================================
 # AI CONFIG
-# Edit only this block when switching provider or model.
+# Keep this block tiny.
+# Most users should only change AI_MODEL_PRESET.
 # ============================================================================
 
 AI_ENABLED = True
 
-# Examples:
-# - Z.ai GLM-4.7-Flash:
-#     AI_PROTOCOL = "chat_completions"
-#     AI_BASE_URL = "https://api.z.ai/api/paas/v4"
-#     AI_MODEL = "glm-4.7-flash"
-#
-# - Mistral Chat Completions:
-#     AI_PROTOCOL = "chat_completions"
-#     AI_BASE_URL = "https://api.mistral.ai/v1"
-#     AI_MODEL = "mistral-small-2603"
-#
-# - OpenAI Responses API:
-#     AI_PROTOCOL = "responses"
-#     AI_BASE_URL = "https://api.openai.com/v1"
-#     AI_MODEL = "gpt-5"
+# Preferred path: choose one preset from MODEL_REGISTRY below.
+AI_MODEL_PRESET = "mistral_small"
 
-AI_PROVIDER_NAME = "mistral_small"
-AI_PROTOCOL = "chat_completions"
-AI_BASE_URL = "https://api.mistral.ai/v1"
-AI_MODEL = "mistral-small-2603"
-AI_API_KEY = (
-    os.environ.get("MISTRAL_API_KEY") or
-    os.environ.get("OPENAI_API_KEY") or
-    os.environ.get("ZAI_API_KEY") or
-    os.environ.get("AI_API_KEY") or
-    "PASTE_YOUR_API_KEY_HERE"
-).strip()
+# Optional manual overrides.
+# Leave empty to use the preset defaults.
+AI_PROVIDER_NAME_OVERRIDE = ""
+AI_PROTOCOL_OVERRIDE = ""
+AI_BASE_URL_OVERRIDE = ""
+AI_MODEL_OVERRIDE = ""
+AI_API_KEY_OVERRIDE = ""
+
 AI_REQUEST_TIMEOUT_SECONDS = 300
 AI_REQUEST_GAP_SECONDS = 2.0
 AI_REQUIRE_FULL_CONTEXT = False
@@ -80,6 +65,100 @@ AI_MAX_CONTEXT_CHARS = 600_000
 AI_MAX_SELECTED_FILES = 180
 AI_MAX_OUTPUT_TOKENS = 8000
 AI_TEMPERATURE = 0.7
+
+
+AIProtocol = Literal["chat_completions", "responses"]
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    provider_name: str
+    protocol: AIProtocol
+    base_url: str
+    model: str
+    env_keys: tuple[str, ...] = ()
+
+
+MODEL_REGISTRY: dict[str, ModelSpec] = {
+    "mistral_small": ModelSpec(
+        provider_name="mistral_small",
+        protocol="chat_completions",
+        base_url="https://api.mistral.ai/v1",
+        model="mistral-small-2603",
+        env_keys=("MISTRAL_API_KEY", "AI_API_KEY"),
+    ),
+    "glm_flash": ModelSpec(
+        provider_name="zai_glm_flash",
+        protocol="chat_completions",
+        base_url="https://api.z.ai/api/paas/v4",
+        model="glm-4.7-flash",
+        env_keys=("ZAI_API_KEY", "AI_API_KEY"),
+    ),
+    "openai_gpt5": ModelSpec(
+        provider_name="openai_gpt5",
+        protocol="responses",
+        base_url="https://api.openai.com/v1",
+        model="gpt-5",
+        env_keys=("OPENAI_API_KEY", "AI_API_KEY"),
+    ),
+}
+
+
+def first_non_empty(*values: str) -> str:
+    for value in values:
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
+def first_env_value(names: tuple[str, ...]) -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
+def resolve_ai_settings(
+    preset: str,
+    *,
+    provider_name_override: str = "",
+    protocol_override: str = "",
+    base_url_override: str = "",
+    model_override: str = "",
+    api_key_override: str = "",
+) -> tuple[str, AIProtocol, str, str, str]:
+    spec = MODEL_REGISTRY.get(preset)
+    if spec is None:
+        known = ", ".join(sorted(MODEL_REGISTRY))
+        raise ValueError(f"Unknown AI_MODEL_PRESET: {preset!r}. Known presets: {known}")
+
+    raw_protocol = first_non_empty(protocol_override, spec.protocol)
+    if raw_protocol not in {"chat_completions", "responses"}:
+        raise ValueError(f"Unsupported ai_protocol: {raw_protocol}")
+    protocol = cast(AIProtocol, raw_protocol)
+
+    provider_name = first_non_empty(provider_name_override, spec.provider_name)
+    base_url = first_non_empty(base_url_override, spec.base_url)
+    model = first_non_empty(model_override, spec.model)
+    api_key = first_non_empty(
+        api_key_override,
+        first_env_value(spec.env_keys),
+        os.environ.get("AI_API_KEY", ""),
+        "PASTE_YOUR_API_KEY_HERE",
+    )
+
+    return provider_name, protocol, base_url, model, api_key
+
+
+AI_PROVIDER_NAME, AI_PROTOCOL, AI_BASE_URL, AI_MODEL, AI_API_KEY = resolve_ai_settings(
+    AI_MODEL_PRESET,
+    provider_name_override=AI_PROVIDER_NAME_OVERRIDE,
+    protocol_override=AI_PROTOCOL_OVERRIDE,
+    base_url_override=AI_BASE_URL_OVERRIDE,
+    model_override=AI_MODEL_OVERRIDE,
+    api_key_override=AI_API_KEY_OVERRIDE,
+)
 
 # ============================================================================
 # AI SYSTEM PROMPT
@@ -444,7 +523,7 @@ class RuntimeConfig:
     ai_enabled: bool = AI_ENABLED
     verbose_explain: bool = VERBOSE_EXPLAIN
     ai_provider_name: str = AI_PROVIDER_NAME
-    ai_protocol: str = AI_PROTOCOL
+    ai_protocol: AIProtocol = AI_PROTOCOL
     ai_base_url: str = AI_BASE_URL
     ai_model: str = AI_MODEL
     ai_api_key: str = AI_API_KEY

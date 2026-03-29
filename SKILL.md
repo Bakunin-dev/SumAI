@@ -54,20 +54,59 @@ python sumai.py all
 
 ---
 
-## Configuration (top of sumai.py)
+## AI Model Router
 
-| Variable | Default | What it controls |
-|---|---|---|
-| `AI_ENABLED` | `True` | Set `False` to skip LLM call, only write `CodebaseDump.md` |
-| `AI_PROVIDER_NAME` | `mistral_small` | Label only, no functional effect |
-| `AI_PROTOCOL` | `chat_completions` | `chat_completions` or `responses` (OpenAI) |
-| `AI_BASE_URL` | Mistral endpoint | Base URL for the provider API |
-| `AI_MODEL` | `mistral-small-2603` | Model name passed to the API |
-| `AI_API_KEY` | from env | Read from `MISTRAL_API_KEY` env var by default |
-| `AI_MAX_CONTEXT_CHARS` | `600_000` | Max chars sent to LLM |
-| `AI_MAX_OUTPUT_TOKENS` | `8000` | Max tokens in LLM response |
+sumai uses a typed preset system at the top of `sumai.py`.
 
-Switching providers: edit `AI_BASE_URL`, `AI_MODEL`, and `AI_PROTOCOL` at the top of `sumai.py`. No other changes needed.
+### Quick switch
+
+```python
+AI_MODEL_PRESET = "mistral_small"  # one line to change model
+```
+
+### Built-in presets
+
+| Preset | Provider | Protocol | Model |
+|--------|----------|----------|-------|
+| `mistral_small` | Mistral | chat_completions | mistral-small-2603 |
+| `glm_flash` | Z.ai | chat_completions | glm-4.7-flash |
+| `openai_gpt5` | OpenAI | responses | gpt-5 |
+
+### Add custom model
+
+One entry in `MODEL_REGISTRY`:
+
+```python
+MODEL_REGISTRY["my_model"] = ModelSpec(
+    provider_name="my_model",
+    protocol="chat_completions",
+    base_url="https://api.example.com/v1",
+    model="my-model-name",
+    env_keys=("MY_API_KEY", "AI_API_KEY"),
+)
+```
+
+Then: `AI_MODEL_PRESET = "my_model"`
+
+### Override mode
+
+```python
+AI_MODEL_PRESET = "mistral_small"
+AI_MODEL_OVERRIDE = "mistral-small-latest"
+AI_BASE_URL_OVERRIDE = "https://my-proxy.com/v1"
+AI_API_KEY_OVERRIDE = "sk-..."
+```
+
+### Legacy config (still works)
+
+For backward compatibility, you can still set these directly:
+- `AI_PROTOCOL`, `AI_BASE_URL`, `AI_MODEL`, `AI_API_KEY`
+
+| Variable | What it controls |
+|---|---|
+| `AI_ENABLED` | Set `False` to skip LLM call |
+| `AI_MAX_CONTEXT_CHARS` | Max chars sent to LLM (default: 600_000) |
+| `AI_MAX_OUTPUT_TOKENS` | Max tokens in response (default: 8000) |
 
 ---
 
@@ -146,7 +185,8 @@ if src_files and readme.stat().st_mtime < max(f.stat().st_mtime for f in src_fil
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `ReadmeDev.md` contains `AI_API_KEY is not configured` | Key not set | `export MISTRAL_API_KEY=...` |
+| `Unknown AI_MODEL_PRESET` error | Preset name misspelled | Check `MODEL_REGISTRY` for valid names |
+| `ReadmeDev.md` contains `AI_API_KEY is not configured` | Key not set | Set env var (e.g., `MISTRAL_API_KEY`) or `AI_API_KEY_OVERRIDE` |
 | `HTTP 401` in placeholder | Wrong or expired API key | Check key validity |
 | `ReadmeDev.md` is generic / invented | Context too large, compact mode triggered | Lower `AI_MAX_CONTEXT_CHARS` or reduce project size |
 | Only `CodebaseDump.md` written | `AI_ENABLED = False` | Set `AI_ENABLED = True` |
