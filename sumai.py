@@ -45,7 +45,6 @@ from typing import Any, Callable
 # ============================================================================
 
 AI_ENABLED = True
-AI_MULTI_AGENT_ENABLED = True
 
 # Examples:
 # - Z.ai GLM-4.7-Flash:
@@ -67,10 +66,16 @@ AI_PROVIDER_NAME = "mistral_small"
 AI_PROTOCOL = "chat_completions"
 AI_BASE_URL = "https://api.mistral.ai/v1"
 AI_MODEL = "mistral-small-2603"
-AI_API_KEY = os.environ.get("MISTRAL_API_KEY", "PASTE_YOUR_API_KEY_HERE").strip()
+AI_API_KEY = (
+    os.environ.get("MISTRAL_API_KEY") or
+    os.environ.get("OPENAI_API_KEY") or
+    os.environ.get("ZAI_API_KEY") or
+    os.environ.get("AI_API_KEY") or
+    "PASTE_YOUR_API_KEY_HERE"
+).strip()
 AI_REQUEST_TIMEOUT_SECONDS = 300
 AI_REQUEST_GAP_SECONDS = 2.0
-AI_REQUIRE_FULL_CONTEXT = True
+AI_REQUIRE_FULL_CONTEXT = False
 AI_MAX_CONTEXT_CHARS = 600_000
 AI_MAX_SELECTED_FILES = 180
 AI_MAX_OUTPUT_TOKENS = 8000
@@ -201,6 +206,7 @@ OUTPUT_ARTIFACT_DIR_NAME = "sumai_artifacts"
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 SCRIPT_NAME = pathlib.Path(__file__).name
 PREFER_GIT_FILE_DISCOVERY = True
+VERBOSE_EXPLAIN = False
 
 # Safety / scale limits
 MAX_FILE_BYTES = 300_000
@@ -436,7 +442,7 @@ class RuntimeConfig:
     max_tree_files: int = MAX_TREE_FILES
     binary_sniff_bytes: int = BINARY_SNIFF_BYTES
     ai_enabled: bool = AI_ENABLED
-    ai_multi_agent_enabled: bool = AI_MULTI_AGENT_ENABLED
+    verbose_explain: bool = VERBOSE_EXPLAIN
     ai_provider_name: str = AI_PROVIDER_NAME
     ai_protocol: str = AI_PROTOCOL
     ai_base_url: str = AI_BASE_URL
@@ -451,6 +457,7 @@ class RuntimeConfig:
     ai_temperature: float | None = AI_TEMPERATURE
     ai_system_prompt: str = AI_SYSTEM_PROMPT
     write_dump: bool = True
+    write_readme: bool = True
     simple_ignore_patterns: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -1916,6 +1923,32 @@ def run_pipeline(
         "included": inspection.stats.included,
     })
 
+    if config.verbose_explain:
+        if logger:
+            logger("[sumai] --- File inclusion explainer ---")
+        for record in inspection.records:
+            reasons: list[str] = []
+            if record.is_binary:
+                reasons.append("binary file")
+            elif record.is_large:
+                reasons.append(f"file too large ({record.size} > {config.max_file_bytes} bytes)")
+            elif record.is_unreadable:
+                reasons.append("unreadable")
+            else:
+                reasons.append("included")
+            if not (record.is_binary or record.is_large or record.is_unreadable):
+                summaries = build_record_summaries(inspection)
+                for s in summaries:
+                    if s['record'].rel_path == record.rel_path:
+                        if s['reasons']:
+                            reasons.append("important: " + ", ".join(s['reasons'][:3]))
+                        reasons.append(f"score={s['priority']}")
+                        break
+            if logger:
+                logger(f"  {'INCL' if 'included' in reasons else 'EXCL'}: {record.rel_path} — {', '.join(reasons)}")
+        if logger:
+            logger("[sumai] --- End of explainer ---")
+
     started = time.perf_counter()
     dump = render_dump(config, discovery, inspection)
     record_stage(timings, "render_dump", started, "ok", {"chars": len(dump.text)})
@@ -1928,18 +1961,24 @@ def run_pipeline(
         record_stage(timings, "write_dump", time.perf_counter(), "skipped", {"reason": "write_dump=False"})
 
     if not config.ai_enabled:
-        started = time.perf_counter()
-        placeholder = build_placeholder_readme("AI is disabled.")
-        atomic_write_text(config.readme_path, placeholder)
-        record_stage(timings, "write_readme", started, "ok", {"path": str(config.readme_path), "reason": "ai_disabled"})
+        if config.write_readme:
+            started = time.perf_counter()
+            placeholder = build_placeholder_readme("AI is disabled.")
+            atomic_write_text(config.readme_path, placeholder)
+            record_stage(timings, "write_readme", started, "ok", {"path": str(config.readme_path), "reason": "ai_disabled"})
+        else:
+            record_stage(timings, "write_readme", time.perf_counter(), "skipped", {"reason": "write_readme=False"})
         record_stage(timings, "build_ai_context", time.perf_counter(), "skipped", {"reason": "ai_disabled"})
         return PipelineResult(return_code=0, timings=timings, discovery=discovery, inspection=inspection, dump=dump)
 
     if not config.ai_api_key or config.ai_api_key == "PASTE_YOUR_API_KEY_HERE":
-        started = time.perf_counter()
-        placeholder = build_placeholder_readme("AI_API_KEY is not configured.")
-        atomic_write_text(config.readme_path, placeholder)
-        record_stage(timings, "write_readme", started, "ok", {"path": str(config.readme_path), "reason": "missing_api_key"})
+        if config.write_readme:
+            started = time.perf_counter()
+            placeholder = build_placeholder_readme("AI_API_KEY is not configured.")
+            atomic_write_text(config.readme_path, placeholder)
+            record_stage(timings, "write_readme", started, "ok", {"path": str(config.readme_path), "reason": "missing_api_key"})
+        else:
+            record_stage(timings, "write_readme", time.perf_counter(), "skipped", {"reason": "write_readme=False"})
         record_stage(timings, "build_ai_context", time.perf_counter(), "skipped", {"reason": "missing_api_key"})
         return PipelineResult(return_code=0, timings=timings, discovery=discovery, inspection=inspection, dump=dump)
 
@@ -1959,6 +1998,12 @@ def run_pipeline(
         "used_compact_mode": ai_context.used_compact_mode,
         "selected_files": ai_context.selected_files,
     })
+
+    if config.verbose_explain and logger:
+        if ai_context.used_compact_mode:
+            logger(f"[sumai] Compact mode: selected {ai_context.selected_files} files from {len(inspection.records)} total (limit: {config.ai_max_context_chars} chars)")
+        else:
+            logger(f"[sumai] Full context mode: {ai_context.selected_files} files ({len(ai_context.text)} chars)")
 
     last_call_finished_at: list[float | None] = [None]
     artifact_results: list[ArtifactResult] = []
@@ -2151,12 +2196,13 @@ def run_pipeline(
 COMMANDS = ("all", "dump", "readme")
 
 
-def parse_args() -> tuple[str, pathlib.Path]:
-    """Parse CLI arguments. Returns (command, project_root)."""
+def parse_args() -> tuple[str, pathlib.Path, bool]:
+    """Parse CLI arguments. Returns (command, project_root, verbose_explain)."""
     import sys as _sys
     args = _sys.argv[1:]
     command = "all"
     project_root = PROJECT_ROOT
+    verbose_explain = VERBOSE_EXPLAIN
 
     # Extract command if first non-flag arg
     if args and not args[0].startswith("-"):
@@ -2185,9 +2231,12 @@ def parse_args() -> tuple[str, pathlib.Path]:
                 )
                 raise SystemExit(1)
             i += 2
+        elif arg in ("--explain", "-e"):
+            verbose_explain = True
+            i += 1
         elif arg in ("--help", "-h"):
             print(
-                "Usage: python sumai.py [command] [--root PATH]\n"
+                "Usage: python sumai.py [command] [--root PATH] [--explain]\n"
                 "\n"
                 "Commands:\n"
                 "  all     Write CodebaseDump.md and ReadmeDev.md (default)\n"
@@ -2196,6 +2245,7 @@ def parse_args() -> tuple[str, pathlib.Path]:
                 "\n"
                 "Options:\n"
                 "  --root PATH, -r PATH   Project root to scan (default: directory of sumai.py)\n"
+                "  --explain, -e          Explain why files are included/excluded/important\n"
                 "  --help, -h             Show this message\n",
                 flush=True,
             )
@@ -2203,19 +2253,19 @@ def parse_args() -> tuple[str, pathlib.Path]:
         else:
             print(f"[sumai] Unknown argument: {arg!r}. Use --help for usage.", flush=True)
             raise SystemExit(1)
-    return command, project_root
+    return command, project_root, verbose_explain
 
 
 def main() -> int:
-    command, project_root = parse_args()
+    command, project_root, verbose_explain = parse_args()
     config = build_runtime_config(project_root=project_root)
 
     if command == "dump":
-        config = replace(config, ai_enabled=False, write_dump=True)
+        config = replace(config, ai_enabled=False, write_dump=True, write_readme=False, verbose_explain=verbose_explain)
     elif command == "readme":
-        config = replace(config, ai_enabled=True, write_dump=False)
+        config = replace(config, ai_enabled=True, write_dump=False, write_readme=True, verbose_explain=verbose_explain)
     else:  # "all"
-        config = replace(config, ai_enabled=True, write_dump=True)
+        config = replace(config, ai_enabled=True, write_dump=True, write_readme=True, verbose_explain=verbose_explain)
 
     result = run_pipeline(config=config, logger=log)
     if config.artifact_dir.exists():
@@ -2229,7 +2279,7 @@ def main() -> int:
         else:
             log(f"[sumai] Done. Wrote {config.dump_name} and {config.readme_name}.")
     else:
-        log("[sumai] Completed with errors. Placeholder ReadmeDev.md was written.")
+        log("[sumai] Completed with errors.")
     return result.return_code
 
 

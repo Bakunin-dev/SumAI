@@ -59,7 +59,6 @@ python sumai.py all
 | Variable | Default | What it controls |
 |---|---|---|
 | `AI_ENABLED` | `True` | Set `False` to skip LLM call, only write `CodebaseDump.md` |
-| `AI_MULTI_AGENT_ENABLED` | `True` | Two-pass pipeline (research + aggregator) |
 | `AI_PROVIDER_NAME` | `mistral_small` | Label only, no functional effect |
 | `AI_PROTOCOL` | `chat_completions` | `chat_completions` or `responses` (OpenAI) |
 | `AI_BASE_URL` | Mistral endpoint | Base URL for the provider API |

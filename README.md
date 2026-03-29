@@ -10,9 +10,9 @@ python sumai.py
 
 ## What it does
 
-1. **Scans** your project — respects `.gitignore`, skips binaries, redacts secrets
+1. **Scans** your project — reads `.gitignore`/`.sumaiignore` patterns, skips binaries, redacts secrets
 2. **Writes `CodebaseDump.md`** — full codebase snapshot in a single markdown file, ready to paste into any AI chat
-3. **Calls an LLM** (optional) — multi-agent pipeline: research pass → aggregator pass
+3. **Calls an LLM** (optional) — two-pass pipeline: research pass → aggregator pass
 4. **Writes `ReadmeDev.md`** — grounded developer reference doc: architecture, entrypoints, runtime flow, extension guide, known gaps
 
 No pip install. No virtualenv. No config files. One Python file, standard library only.
@@ -52,23 +52,23 @@ all    → CodebaseDump.md + ReadmeDev.md
 Edit the `AI CONFIG` block at the top of `sumai.py`:
 
 ```python
-# Mistral (default)
+# Mistral (default) — set MISTRAL_API_KEY env var
 AI_PROTOCOL = "chat_completions"
 AI_BASE_URL  = "https://api.mistral.ai/v1"
 AI_MODEL     = "mistral-small-2603"
 
-# OpenAI
+# OpenAI — set OPENAI_API_KEY env var
 AI_PROTOCOL = "responses"
 AI_BASE_URL  = "https://api.openai.com/v1"
-AI_MODEL     = "gpt-4o"
+AI_MODEL     = "gpt-4o-mini"
 
-# Z.ai GLM
+# Z.ai GLM — set ZAI_API_KEY env var
 AI_PROTOCOL = "chat_completions"
 AI_BASE_URL  = "https://api.z.ai/api/paas/v4"
 AI_MODEL     = "glm-4.7-flash"
 ```
 
-Any provider that speaks OpenAI-compatible Chat Completions works. Set `AI_ENABLED = False` to skip the LLM call and only generate `CodebaseDump.md`.
+Most OpenAI-compatible APIs should work. Set `AI_ENABLED = False` to skip the LLM call and only generate `CodebaseDump.md`.
 
 ---
 
