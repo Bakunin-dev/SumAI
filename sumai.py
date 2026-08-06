@@ -1,462 +1,283 @@
-#!/usr/bin/env python3
+
 """
-sumai.py
+codebase_dump.py
 
-One-file, zero-dependency project summarizer.
+One-file, zero-dependency CodebaseDump generator.
 
-Pipeline:
-1) Scan the current project and write CodebaseDump.md
-2) Build a compact repository context
-3) Optionally call an LLM and write ReadmeDev.md
+Goal:
+- Drop this file into a repository root.
+- Double-click it or run `python codebase_dump.py`.
+- Get a clean `snapcode_<project-folder>.md` with handwritten source, docs, schemas, and small important configs.
 
-The file is intentionally structured as small testable nodes.
-Each stage has a dedicated function and the pipeline returns per-stage timings.
+What it intentionally does NOT do:
+- No AI calls.
+- No HTTP.
+- No RepoContext / ranking / AST summarization.
+- No dependencies outside Python stdlib.
 
-How to use:
-- put this file anywhere (or keep it outside the project)
-- edit the AI CONFIG block near the top
-- run: python sumai.py all                        # write CodebaseDump.md + ReadmeDev.md
-- run: python sumai.py dump                       # write CodebaseDump.md only (no AI)
-- run: python sumai.py readme                     # write ReadmeDev.md only (no dump saved)
-- run: python sumai.py [command] --root /path     # scan a specific directory
+Useful commands:
+- python codebase_dump.py
+- python codebase_dump.py --root /path/to/project
+- python codebase_dump.py --explain
+- python codebase_dump.py --include-lockfiles
+- python codebase_dump.py --include-generated
+- python codebase_dump.py --include-all-configs
+
+Notes:
+- .env is skipped, but .env.example/.env.sample/.env.template are included with env-aware redaction.
+- Code fences are widened automatically, so markdown files with nested ``` blocks remain valid.
 """
 
 from __future__ import annotations
 
-import ast
+import argparse
 import datetime as _dt
 import fnmatch
-import json
 import os
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
-import shutil
 import time
-import urllib.error
-import urllib.request
-from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Callable, Literal, cast
+from dataclasses import dataclass, field, replace
+from typing import Callable, Iterable
 
-# ============================================================================
-# AI CONFIG
-# Keep this block tiny.
-# Most users should only change AI_MODEL_PRESET.
-# ============================================================================
+# =============================================================================
+# PRODUCT SETTINGS
+# =============================================================================
 
-AI_ENABLED = True
-
-# Preferred path: choose one preset from MODEL_REGISTRY below.
-AI_MODEL_PRESET = "mistral_small"
-
-# Optional manual overrides.
-# Leave empty to use the preset defaults.
-AI_PROVIDER_NAME_OVERRIDE = ""
-AI_PROTOCOL_OVERRIDE = ""
-AI_BASE_URL_OVERRIDE = ""
-AI_MODEL_OVERRIDE = ""
-AI_API_KEY_OVERRIDE = ""
-
-AI_REQUEST_TIMEOUT_SECONDS = 300
-AI_REQUEST_GAP_SECONDS = 2.0
-AI_REQUIRE_FULL_CONTEXT = False
-AI_MAX_CONTEXT_CHARS = 600_000
-AI_MAX_SELECTED_FILES = 180
-AI_MAX_OUTPUT_TOKENS = 8000
-AI_TEMPERATURE = 0.7
-
-
-AIProtocol = Literal["chat_completions", "responses"]
-
-
-@dataclass(frozen=True)
-class ModelSpec:
-    provider_name: str
-    protocol: AIProtocol
-    base_url: str
-    model: str
-    env_keys: tuple[str, ...] = ()
-
-
-MODEL_REGISTRY: dict[str, ModelSpec] = {
-    "mistral_small": ModelSpec(
-        provider_name="mistral_small",
-        protocol="chat_completions",
-        base_url="https://api.mistral.ai/v1",
-        model="mistral-small-2603",
-        env_keys=("MISTRAL_API_KEY", "AI_API_KEY"),
-    ),
-    "glm_flash": ModelSpec(
-        provider_name="zai_glm_flash",
-        protocol="chat_completions",
-        base_url="https://api.z.ai/api/paas/v4",
-        model="glm-4.7-flash",
-        env_keys=("ZAI_API_KEY", "AI_API_KEY"),
-    ),
-    "openai_gpt5": ModelSpec(
-        provider_name="openai_gpt5",
-        protocol="responses",
-        base_url="https://api.openai.com/v1",
-        model="gpt-5",
-        env_keys=("OPENAI_API_KEY", "AI_API_KEY"),
-    ),
-}
-
-
-def first_non_empty(*values: str) -> str:
-    for value in values:
-        if value and value.strip():
-            return value.strip()
-    return ""
-
-
-def first_env_value(names: tuple[str, ...]) -> str:
-    for name in names:
-        value = os.environ.get(name)
-        if value and value.strip():
-            return value.strip()
-    return ""
-
-
-def resolve_ai_settings(
-    preset: str,
-    *,
-    provider_name_override: str = "",
-    protocol_override: str = "",
-    base_url_override: str = "",
-    model_override: str = "",
-    api_key_override: str = "",
-) -> tuple[str, AIProtocol, str, str, str]:
-    spec = MODEL_REGISTRY.get(preset)
-    if spec is None:
-        known = ", ".join(sorted(MODEL_REGISTRY))
-        raise ValueError(f"Unknown AI_MODEL_PRESET: {preset!r}. Known presets: {known}")
-
-    raw_protocol = first_non_empty(protocol_override, spec.protocol)
-    if raw_protocol not in {"chat_completions", "responses"}:
-        raise ValueError(f"Unsupported ai_protocol: {raw_protocol}")
-    protocol = cast(AIProtocol, raw_protocol)
-
-    provider_name = first_non_empty(provider_name_override, spec.provider_name)
-    base_url = first_non_empty(base_url_override, spec.base_url)
-    model = first_non_empty(model_override, spec.model)
-    api_key = first_non_empty(
-        api_key_override,
-        first_env_value(spec.env_keys),
-        os.environ.get("AI_API_KEY", ""),
-        "PASTE_YOUR_API_KEY_HERE",
-    )
-
-    return provider_name, protocol, base_url, model, api_key
-
-
-AI_PROVIDER_NAME, AI_PROTOCOL, AI_BASE_URL, AI_MODEL, AI_API_KEY = resolve_ai_settings(
-    AI_MODEL_PRESET,
-    provider_name_override=AI_PROVIDER_NAME_OVERRIDE,
-    protocol_override=AI_PROTOCOL_OVERRIDE,
-    base_url_override=AI_BASE_URL_OVERRIDE,
-    model_override=AI_MODEL_OVERRIDE,
-    api_key_override=AI_API_KEY_OVERRIDE,
-)
-
-# ============================================================================
-# AI SYSTEM PROMPT
-# ============================================================================
-
-AI_SYSTEM_PROMPT = (
-    "Use only the repository context you are given. Treat runtime code, configuration, tests, scripts, and dependency files as stronger evidence than markdown docs. "
-    "Prefer practical navigation, operational usefulness, and technical clarity over generic summaries. "
-    "If something is missing or unclear, say 'Not found in provided context' instead of inventing details."
-)
-
-# ============================================================================
-# ARTIFACT & PROMPT CONFIG
-# Edit prompts here to customize AI behavior.
-# ============================================================================
-
-ARTIFACT_FOCUS = (
-    'Collect a broad, dense, high-signal technical research artifact for a later README_DEV pass. '
-    'Prioritize repository structure, key files, entrypoints, runtime flow, architecture, data/domain model, '
-    'commands, verification, config/environment, docs/scripts/ops signals, extension points, risks, gaps, and unknowns. '
-    'The goal is not a minimal summary. The goal is a rich technical handoff that preserves as much useful grounded context as possible.'
-)
-
-RESEARCH_PROMPT_SECTIONS = [
-    "## Scope",
-    "## Project Identity",
-    "## Project Skeleton",
-    "## Directory And File Guide",
-    "## Tech Stack And Tooling",
-    "## Entrypoints And Runtime",
-    "## Architecture Overview",
-    "## Core Data And Domain",
-    "## Commands And Verification",
-    "## Configuration And Environment",
-    "## Docs Scripts Ops And Integrations",
-    "## Extension Points",
-    "## Risks Gaps And Unknowns",
-    "## Evidence Index",
-    "## Aggregator Carry-Forward",
-]
-
-RESEARCH_PROMPT_GOAL = (
-    "Collect a rich, grounded technical research pack for a later README_DEV pass. "
-    "Prioritize structure, key files, entrypoints, runtime flow, architecture, data/domain model, "
-    "commands, verification, config, ops signals, extension points, risks, gaps, and unknowns."
-)
-
-RESEARCH_PROMPT_RULES = [
-    "Use only the provided repository context.",
-    "Prefer runtime code, config, tests, scripts, dependency files, and CI/deploy files over markdown docs.",
-    "Preserve useful technical detail; do not optimize for shortness.",
-    "Use exact file paths, modules, classes, functions, env vars, commands, endpoints, and symbols whenever possible.",
-    "Show a compact project skeleton with only important folders and key files.",
-    "Summarize only important directories and files, and explain why they matter.",
-    "Include only explicit or strongly evidenced commands.",
-    "Mark non-explicit architecture or structure as `Likely`.",
-    "Describe main entities, states, stores, and relationships when present.",
-    "Explain where new features, handlers, services, modules, entities, or tests are usually added.",
-    "Separate confirmed gaps, likely weak spots, and unknown areas.",
-    "Use `[Confirmed]`, `[Likely]`, and `[Unknown]`.",
-    "Support non-trivial claims with file paths inline or nearby.",
-    "Do not invent commands, services, deployment targets, databases, external systems, architecture, or workflows.",
-    "Do not write the final README_DEV.",
-    "In Evidence Index, list the strongest supporting files and why they matter.",
-    "In Aggregator Carry-Forward, provide a dense bullet list of the most important grounded facts, commands, invariants, boundaries, and structural cues.",
-]
-
-README_PROMPT_SECTIONS = [
-    "# <Project Name> — README_DEV",
-    "Short opening paragraph",
-    "## What This Project Is",
-    "## Project Skeleton",
-    "## Directory And File Guide",
-    "## Technical Summaries",
-    "### Stack Summary",
-    "### Tooling Summary",
-    "### Configuration Summary",
-    "### Testing Summary",
-    "### Operations Summary",
-    "## Entry Points And Runtime Flow",
-    "## Architecture Overview",
-    "### Layers And Responsibilities",
-    "### Key Module Relationships",
-    "### Main Execution Paths",
-    "## Core Data And Domain Model",
-    "## Key Commands",
-    "## Verification And Done Criteria",
-    "## Architectural Invariants",
-    "## Safety And Boundaries",
-    "## Configuration And Environment",
-    "## Extension Guide",
-    "## Known Gaps And Technical Debt",
-    "## Useful Pointers",
-    "## Analysis Notes",
-]
-
-README_PROMPT_RULES = [
-    "Use the research artifact to focus attention, then verify everything against repository context.",
-    "If artifact and repository context conflict, prefer repository context.",
-    "Prefer runtime code, config, tests, scripts, dependency files, CI/deploy files, and executable evidence over markdown docs.",
-    "Produce a rich, grounded README_DEV, not a minimal summary.",
-    "Include a compact but useful skeleton tree with only important folders and key files.",
-    "Summarize only important areas; do not explain every file.",
-    "Include short technical summaries with real value, not filler.",
-    "Use exact file paths, modules, symbols, commands, env vars, and script names whenever possible.",
-    "Include practical guidance on where changes are usually made and what to verify after changes.",
-    "Avoid generic advice that would fit any repository.",
-    "Do not paraphrase code unless it adds navigational or operational value.",
-    "Do not invent commands, deployment targets, services, data stores, architecture, CI, security controls, or workflows.",
-    "Label doc-derived points as `Doc-stated`.",
-    "Label plausible but non-explicit points as `Likely`.",
-    "For missing information, say `Not found in provided context`.",
-    "Do not treat generated artifacts or temp files as core project docs unless clearly part of the workflow.",
-    "Keep the tone dry, technical, and useful.",
-]
-
-# ============================================================================
-# OUTPUT / PROJECT CONFIG
-# ============================================================================
-
-OUTPUT_DUMP_NAME = "CodebaseDump.md"
-OUTPUT_README_NAME = "ReadmeDev.md"
-OUTPUT_ARTIFACT_DIR_NAME = "sumai_artifacts"
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
+OUTPUT_DUMP_PREFIX = "snapcode"
+OUTPUT_DUMP_NAME = f"{OUTPUT_DUMP_PREFIX}_project.md"
+GENERATOR_VERSION = "0.5.0"
 SCRIPT_NAME = pathlib.Path(__file__).name
-PREFER_GIT_FILE_DISCOVERY = True
-VERBOSE_EXPLAIN = False
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 
-# Safety / scale limits
-MAX_FILE_BYTES = 300_000
-MAX_TREE_FILES = 12_000
+PREFER_GIT_FILE_DISCOVERY = True
+
+# Per-file limits. These are intentionally conservative: a useful LLM dump should
+# not quietly absorb megabytes of generated output, cache, fixtures, or snapshots.
+MAX_CODE_FILE_BYTES = 350_000
+MAX_DOC_FILE_BYTES = 250_000
+MAX_CONFIG_FILE_BYTES = 90_000
+MAX_SCHEMA_FILE_BYTES = 180_000
+MAX_TEXT_FILE_BYTES = 120_000
+MAX_TREE_FILES = 25_000
 BINARY_SNIFF_BYTES = 8_192
 
-# ============================================================================
-# FILTER POLICY
-# ============================================================================
+# A final hard cap for the output file. When this cap is reached, remaining file
+# contents are skipped but listed in the skipped section.
+MAX_TOTAL_DUMP_BYTES = 5_000_000
+
+# =============================================================================
+# ALLOW POLICY: things that are useful for understanding a codebase
+# =============================================================================
+
+CODE_SUFFIXES = {
+    # Python
+    ".py", ".pyi",
+    # JavaScript / TypeScript / web frameworks
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".vue", ".svelte", ".astro",
+    # Web templates/styles
+    ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    # Backend / compiled languages
+    ".go", ".rs", ".java", ".kt", ".kts", ".cs", ".php", ".rb", ".swift",
+    ".scala", ".clj", ".cljs", ".ex", ".exs", ".erl", ".hrl",
+    # C / C++ / Objective-C
+    ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".m", ".mm",
+    # Scripts
+    ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd",
+    # Infra as code / query languages
+    ".sql", ".graphql", ".gql", ".proto", ".prisma", ".tf",
+    # 1C / OneScript
+    ".bsl", ".os",
+}
+
+DOC_SUFFIXES = {".md", ".mdx", ".rst", ".adoc"}
+
+SCHEMA_SUFFIXES = {
+    ".graphql", ".gql", ".proto", ".prisma", ".sql",
+    ".jsonschema", ".avsc",
+}
+
+# Generic config suffixes are NOT always included. They are included when the path
+# looks important/manual, or when --include-all-configs is used.
+CONFIG_SUFFIXES = {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf"}
+
+IMPORTANT_CONFIG_FILENAMES = {
+    # Python
+    "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "requirements-dev.txt",
+    "requirements-test.txt", "pipfile", "tox.ini", "pytest.ini", "mypy.ini", "ruff.toml",
+    ".ruff.toml", ".python-version",
+    # Node / web
+    "package.json", "tsconfig.json", "tsconfig.base.json", "jsconfig.json",
+    "vite.config.js", "vite.config.ts", "vite.config.mjs",
+    "next.config.js", "next.config.ts", "next.config.mjs",
+    "nuxt.config.js", "nuxt.config.ts", "svelte.config.js", "svelte.config.ts",
+    "astro.config.js", "astro.config.ts",
+    "tailwind.config.js", "tailwind.config.ts", "postcss.config.js", "postcss.config.cjs",
+    "eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", ".eslintrc", ".eslintrc.js",
+    ".eslintrc.cjs", ".eslintrc.json", ".prettierrc", ".prettierrc.json", ".prettierrc.js",
+    # Docker / build / general
+    "dockerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml",
+    "makefile", "cmakelists.txt", ".editorconfig", ".gitignore", ".dockerignore",
+    # Rust / Go / Java / .NET / PHP / Ruby
+    "cargo.toml", "go.mod", "go.work", "pom.xml", "build.gradle", "build.gradle.kts",
+    "settings.gradle", "settings.gradle.kts", "global.json", "composer.json", "gemfile",
+    # CI / metadata
+    ".gitlab-ci.yml", ".github/workflows", "renovate.json", "dependabot.yml",
+    # AI/dev-tooling dotfiles that shape how agents inspect the repo
+    ".claudeignore", "claude.md", ".codebasedumpignore", ".sumaiignore",
+}
+
+IMPORTANT_CONFIG_PATH_PARTS = {
+    "config", "configs", "settings", "conf", ".github", "workflows", "ci", "deploy",
+    "deployment", "docker", "k8s", "kubernetes", "helm", "charts",
+}
+
+TEXT_LIKE_FILENAMES = {
+    "license", "licence", "copying", "notice", "authors", "contributors", "changelog",
+    "changes", "todo", "readme", "contributing", "codeowners",
+    "manual.txt", "help.txt", "usage.txt", "notes.txt", "todo.txt", "changelog.txt",
+}
+
+MANUAL_TEXT_GLOBS = {
+    "manual.txt", "*_manual.txt", "*-manual.txt", "manual_*.txt",
+    "*_manul.txt", "*-manul.txt", "check_*manual*.txt", "check_*manul*.txt",
+    "help.txt", "usage.txt", "notes.txt", "todo.txt", "changelog.txt",
+}
+
+LANGUAGE_BY_SUFFIX = {
+    ".py": "python", ".pyi": "python",
+    ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".ts": "typescript", ".tsx": "tsx", ".jsx": "jsx",
+    ".vue": "vue", ".svelte": "svelte", ".astro": "astro",
+    ".java": "java", ".kt": "kotlin", ".kts": "kotlin",
+    ".rs": "rust", ".go": "go", ".rb": "ruby", ".php": "php", ".swift": "swift",
+    ".scala": "scala", ".clj": "clojure", ".cljs": "clojure",
+    ".ex": "elixir", ".exs": "elixir", ".erl": "erlang", ".hrl": "erlang",
+    ".c": "c", ".h": "c", ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
+    ".hpp": "cpp", ".hh": "cpp", ".cs": "csharp", ".m": "objective-c", ".mm": "objective-cpp",
+    ".sh": "bash", ".bash": "bash", ".zsh": "bash", ".fish": "fish",
+    ".ps1": "powershell", ".bat": "batch", ".cmd": "batch",
+    ".sql": "sql", ".graphql": "graphql", ".gql": "graphql", ".proto": "protobuf",
+    ".prisma": "prisma", ".tf": "hcl",
+    ".html": "html", ".htm": "html", ".css": "css", ".scss": "scss", ".sass": "sass", ".less": "less",
+    ".json": "json", ".yaml": "yaml", ".yml": "yaml", ".toml": "toml",
+    ".ini": "ini", ".cfg": "ini", ".conf": "conf", ".xml": "xml",
+    ".md": "markdown", ".mdx": "mdx", ".rst": "rst", ".adoc": "asciidoc",
+    ".bsl": "bsl", ".os": "onescript",
+}
+
+SPECIAL_LANGUAGE_BY_NAME = {
+    "dockerfile": "dockerfile",
+    "makefile": "makefile",
+    "cmakelists.txt": "cmake",
+    "gemfile": "ruby",
+    "pipfile": "toml",
+}
+
+# =============================================================================
+# DENY POLICY: things that should not enter an LLM code dump by default
+# =============================================================================
 
 EXCLUDED_DIR_NAMES = {
-    ".git",
-    ".hg",
-    ".svn",
-    ".jj",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".tox",
-    ".nox",
-    ".cache",
-    ".next",
-    ".nuxt",
-    ".parcel-cache",
-    ".svelte-kit",
-    ".turbo",
-    ".idea",
-    ".vscode",
-    ".venv",
-    "venv",
-    "env",
-    ".env",
-    "node_modules",
-    "dist",
-    "build",
-    "target",
-    "coverage",
-    ".coverage_html",
-    ".gradle",
-    ".terraform",
-    ".serverless",
-    ".aws-sam",
-    ".dart_tool",
-    ".yarn",
-    ".pnpm-store",
-    ".gitlab",
-    OUTPUT_ARTIFACT_DIR_NAME,
+    # VCS
+    ".git", ".hg", ".svn", ".jj",
+    # Python
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox",
+    ".venv", "venv", "env", ".env", ".ipynb_checkpoints", "htmlcov",
+    # JS / web
+    "node_modules", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache",
+    ".vite", "dist", "build", "coverage",
+    # Other ecosystems
+    "target", "vendor", ".gradle", "out", "bin", "obj",
+    # Infra / mobile
+    ".terraform", ".serverless", ".aws-sam", "cdk.out", ".dart_tool", "pods", "deriveddata",
+    # IDE / OS / generic cache
+    ".idea", ".vscode", ".vs", ".cache", "cache", "tmp", "temp",
+    # ML / AI / generated experiment artifacts
+    "runs", "wandb", "mlruns", "lightning_logs", "checkpoints", "outputs", "artifacts",
 }
 
 EXCLUDED_FILE_NAMES = {
-    OUTPUT_DUMP_NAME,
-    OUTPUT_README_NAME,
-    SCRIPT_NAME,
-    "AIContext.md",
-    ".DS_Store",
-    "Thumbs.db",
-    "desktop.ini",
-    ".coverage",
-    "package-lock.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    "bun.lockb",
-    "poetry.lock",
-    "Pipfile.lock",
-    "Cargo.lock",
-    ".npmrc",
-    ".pypirc",
-    ".netrc",
-    "id_rsa",
-    "id_dsa",
+    OUTPUT_DUMP_NAME.lower(),
+    "aicontext.md",
+    ".ds_store", "thumbs.db", "desktop.ini",
+    ".coverage", ".npmrc", ".pypirc", ".netrc",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
 }
 
-EXCLUDED_SUFFIXES = {
-    ".pyc", ".pyo", ".pyd",
+LOCK_FILENAMES = {
+    "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb",
+    "poetry.lock", "pipfile.lock", "cargo.lock", "composer.lock", "gemfile.lock",
+    "go.sum", "gradle.lockfile",
+}
+
+SECRET_FILENAMES = {
+    ".env", ".env.local", ".env.development", ".env.production", ".env.test",
+    "secrets.json", "secret.json", "secrets.yaml", "secret.yaml", "credentials.json",
+}
+
+ENV_TEMPLATE_FILENAMES = {
+    ".env.example", ".env.sample", ".env.template", ".env.dist",
+    "env.example", "env.sample", "env.template",
+}
+
+# Old/generated context artifacts must never be absorbed into a new dump.
+DUMP_ARTIFACT_GLOBS = {
+    "CodebaseDump*.md", "RepoContext*.md", "AIContext*.md",
+    "codebase_dump*.md", "repo_context*.md", "ai_context*.md",
+    "snapcode_*.md",
+}
+
+BINARY_OR_DATA_SUFFIXES = {
+    # Images / media / fonts
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico", ".svg",
-    ".mp3", ".wav", ".ogg", ".flac", ".aac",
-    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".mp3", ".wav", ".ogg", ".flac", ".aac", ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".ttf", ".otf", ".woff", ".woff2", ".eot",
+    # Archives / documents
     ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
     ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
-    ".ttf", ".otf", ".woff", ".woff2", ".eot",
-    ".jar", ".war", ".so", ".dylib", ".dll", ".exe", ".bin", ".obj", ".o", ".a", ".lib",
-    ".class", ".sqlite", ".db", ".sqlite3",
-    ".pem", ".key", ".p12", ".pfx", ".crt", ".cer", ".der",
-    ".min.js", ".min.css",
+    # Binary/build outputs
+    ".pyc", ".pyo", ".pyd", ".jar", ".war", ".class", ".so", ".dylib", ".dll",
+    ".exe", ".bin", ".obj", ".o", ".a", ".lib",
+    # DB / datasets / model weights
+    ".sqlite", ".sqlite3", ".db", ".pkl", ".pickle", ".npy", ".npz", ".parquet",
+    ".pt", ".pth", ".onnx", ".safetensors", ".ckpt",
 }
 
-EXCLUDED_GLOBS = [
-    "*.log",
-    "*.tmp",
-    "*.swp",
-    "*.swo",
-    "*.seed",
-    ".env",
-    ".env.*",
-    "*.env",
-    "*.local",
-    "secrets.*",
-    "secret.*",
-    "*.secret",
-    "*.cache",
-    "*.lock",
-]
-
-LANGUAGE_BY_SUFFIX = {
-    ".py": "python",
-    ".pyi": "python",
-    ".js": "javascript",
-    ".mjs": "javascript",
-    ".cjs": "javascript",
-    ".ts": "typescript",
-    ".tsx": "tsx",
-    ".jsx": "jsx",
-    ".java": "java",
-    ".kt": "kotlin",
-    ".rs": "rust",
-    ".go": "go",
-    ".rb": "ruby",
-    ".php": "php",
-    ".swift": "swift",
-    ".c": "c",
-    ".h": "c",
-    ".cpp": "cpp",
-    ".cc": "cpp",
-    ".cxx": "cpp",
-    ".hpp": "cpp",
-    ".cs": "csharp",
-    ".scala": "scala",
-    ".sh": "bash",
-    ".bash": "bash",
-    ".zsh": "bash",
-    ".ps1": "powershell",
-    ".sql": "sql",
-    ".html": "html",
-    ".htm": "html",
-    ".css": "css",
-    ".scss": "scss",
-    ".sass": "sass",
-    ".less": "less",
-    ".json": "json",
-    ".jsonl": "json",
-    ".yaml": "yaml",
-    ".yml": "yaml",
-    ".toml": "toml",
-    ".xml": "xml",
-    ".md": "markdown",
-    ".tf": "hcl",
-    ".ini": "ini",
-    ".cfg": "ini",
-    ".txt": "text",
-    ".csv": "csv",
+GENERATED_SUFFIXES = {
+    ".min.js", ".min.css", ".map", ".bundle.js", ".bundle.css",
 }
 
-SPECIAL_FILENAMES = {
-    "Dockerfile": "dockerfile",
-    "docker-compose.yml": "yaml",
-    "docker-compose.yaml": "yaml",
-    "Makefile": "makefile",
-    "CMakeLists.txt": "cmake",
-    ".gitignore": "gitignore",
-    ".gitattributes": "gitattributes",
-    ".editorconfig": "ini",
-    "requirements.txt": "text",
+GENERATED_GLOBS = {
+    "*.generated.*", "*.gen.*", "*_generated.*", "*_pb2.py", "*_pb2_grpc.py",
+    "*.pb.go", "*.g.cs", "*.designer.cs", "*.designer.vb",
+    "*.swagger.json", "openapi.generated.*",
 }
+
+NOISY_TEXT_GLOBS = {
+    "*.log", "*.tmp", "*.temp", "*.swp", "*.swo", "*.bak", "*.backup", "*.old",
+    "*.cache", "*.coverage", "*.lcov", "*.snap", "*.snapshot",
+}
+
+SIMPLE_IGNORE_FILES = (".codebasedumpignore", ".sumaiignore", ".ignore", ".gitignore")
+
+# bytes that strongly suggest a non-text file
+NON_TEXT_BYTES = set(range(0, 9)) | {11, 12} | set(range(14, 32))
+
+# =============================================================================
+# SECRET REDACTION
+# =============================================================================
 
 SENSITIVE_QUOTED_ASSIGNMENT_RE = re.compile(
-    r'''(?im)^(\s*(?:export\s+)?["']?[\w.\-]*(?:api[_-]?key|apikey|secret|token|password|passwd|pwd|database[_-]?url|db[_-]?url|connection[_-]?string|dsn|client[_-]?secret|private[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|authorization)[\w.\-]*["']?\s*[:=]\s*["'])([^"\r\n]+)(["'])'''
+    r'''(?im)^(\s*(?:export\s+)?["']?[\w.\-]*(?:api[_-]?key|apikey|secret|token|password|passwd|pwd|database[_-]?url|db[_-]?url|connection[_-]?string|dsn|client[_-]?secret|private[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|authorization)[\w.\-]*["']?\s*[:=]\s*["'])([^"'\r\n]+)(["'])'''
 )
 
 SENSITIVE_UNQUOTED_ASSIGNMENT_RE = re.compile(
-    r'''(?im)^(\s*(?:export\s+)?["']?[\w.\-]*(?:api[_-]?key|apikey|secret|token|password|passwd|pwd|database[_-]?url|db[_-]?url|connection[_-]?string|dsn|client[_-]?secret|private[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|authorization)[\w.\-]*["']?\s*[:=]\s*)([^\s#\r\n]+)'''
+    r'''(?im)^(\s*(?:export\s+)?["']?[\w.\-]*(?:api[_-]?key|apikey|secret|token|password|passwd|pwd|database[_-]?url|db[_-]?url|connection[_-]?string|dsn|client[_-]?secret|private[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|authorization)[\w.\-]*["']?\s*[:=]\s*)([^\s#"'\r\n]+)'''
 )
 
 INLINE_SECRET_PATTERNS = [
@@ -476,95 +297,77 @@ PRIVATE_KEY_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
-IMPORTANCE_PATTERNS = [
-    (r"(^|/)README(\.[^/]+)?$", 120),
-    (r"(^|/)pyproject\.toml$", 110),
-    (r"(^|/)package\.json$", 110),
-    (r"(^|/)requirements(\.[^/]+)?\.txt$", 105),
-    (r"(^|/)setup\.py$", 102),
-    (r"(^|/)pytest\.ini$", 98),
-    (r"(^|/)Pipfile$", 100),
-    (r"(^|/)Dockerfile$", 100),
-    (r"(^|/)docker-compose(\.ya?ml)?$", 100),
-    (r"(^|/)Makefile$", 95),
-    (r"(^|/)compose\.ya?ml$", 95),
-    (r"(^|/)main\.[A-Za-z0-9]+$", 90),
-    (r"(^|/)app\.[A-Za-z0-9]+$", 85),
-    (r"(^|/)server\.[A-Za-z0-9]+$", 85),
-    (r"(^|/)manage\.py$", 85),
-    (r"(^|/)settings\.[A-Za-z0-9]+$", 80),
-    (r"(^|/)routes?\.[A-Za-z0-9]+$", 75),
-    (r"(^|/)config\.[A-Za-z0-9]+$", 75),
-    (r"(^|/)src/", 25),
-    (r"(^|/)app/", 20),
-    (r"(^|/)core/", 20),
-    (r"(^|/)tests?/", -30),
-    (r"(^|/)migrations?/", -25),
-]
+# Extra guard for .env.example / env-like assignment blocks. These files are useful
+# for agents because they show required settings, but teams sometimes accidentally
+# put real keys into templates. Keep harmless defaults (ports, booleans, paths),
+# redact secret-looking names and token-looking values.
+ENV_ASSIGNMENT_RE = re.compile(
+    r'''(?m)^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)(.*)$'''
+)
 
-NON_TEXT_BYTES = set(range(0, 9)) | {11, 12} | set(range(14, 32))
+ENV_SECRET_NAME_RE = re.compile(
+    r'''(?ix)
+    (?:
+        api[_-]?key|apikey|secret|token|password|passwd|pwd|
+        private[_-]?key|client[_-]?secret|
+        access[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|authorization|
+        database[_-]?url|db[_-]?url|connection[_-]?string|dsn
+    )
+    '''
+)
 
-# ============================================================================
+JWT_LIKE_RE = re.compile(r'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}')
+
+GENERATED_CONTENT_MARKERS = (
+    "@generated",
+    "auto-generated",
+    "autogenerated",
+    "automatically generated",
+    "generated by",
+    "code generated by",
+    "do not edit",
+    "do not modify",
+    "this file was generated",
+)
+
+# =============================================================================
 # DATA MODELS
-# ============================================================================
+# =============================================================================
 
 
 @dataclass(frozen=True)
 class RuntimeConfig:
     project_root: pathlib.Path
-    dump_name: str = OUTPUT_DUMP_NAME
-    readme_name: str = OUTPUT_README_NAME
-    artifact_dir_name: str = OUTPUT_ARTIFACT_DIR_NAME
+    output_name: str = OUTPUT_DUMP_NAME
     script_name: str = SCRIPT_NAME
     prefer_git_file_discovery: bool = PREFER_GIT_FILE_DISCOVERY
-    max_file_bytes: int = MAX_FILE_BYTES
     max_tree_files: int = MAX_TREE_FILES
-    binary_sniff_bytes: int = BINARY_SNIFF_BYTES
-    ai_enabled: bool = AI_ENABLED
-    verbose_explain: bool = VERBOSE_EXPLAIN
-    ai_provider_name: str = AI_PROVIDER_NAME
-    ai_protocol: AIProtocol = AI_PROTOCOL
-    ai_base_url: str = AI_BASE_URL
-    ai_model: str = AI_MODEL
-    ai_api_key: str = AI_API_KEY
-    ai_request_timeout_seconds: int = AI_REQUEST_TIMEOUT_SECONDS
-    ai_request_gap_seconds: float = AI_REQUEST_GAP_SECONDS
-    ai_require_full_context: bool = AI_REQUIRE_FULL_CONTEXT
-    ai_max_context_chars: int = AI_MAX_CONTEXT_CHARS
-    ai_max_selected_files: int = AI_MAX_SELECTED_FILES
-    ai_max_output_tokens: int = AI_MAX_OUTPUT_TOKENS
-    ai_temperature: float | None = AI_TEMPERATURE
-    ai_system_prompt: str = AI_SYSTEM_PROMPT
-    write_dump: bool = True
-    write_readme: bool = True
+    max_total_dump_bytes: int = MAX_TOTAL_DUMP_BYTES
+    include_lockfiles: bool = False
+    include_generated: bool = False
+    include_all_configs: bool = False
+    include_hidden_files: bool = True
+    explain: bool = False
     simple_ignore_patterns: tuple[str, ...] = field(default_factory=tuple)
 
     @property
-    def dump_path(self) -> pathlib.Path:
-        return self.project_root / self.dump_name
-
-    @property
-    def readme_path(self) -> pathlib.Path:
-        return self.project_root / self.readme_name
-
-    @property
-    def artifact_dir(self) -> pathlib.Path:
-        return self.project_root / self.artifact_dir_name
+    def output_path(self) -> pathlib.Path:
+        return self.project_root / self.output_name
 
 
 @dataclass(frozen=True)
-class DiscoveryResult:
-    files: list[pathlib.Path]
-    backend: str
-    truncated: bool
+class IncludeDecision:
+    include: bool
+    category: str
+    language: str
+    reason: str
+    max_bytes: int = MAX_TEXT_FILE_BYTES
 
 
 @dataclass(frozen=True)
-class FileStats:
-    included: int = 0
-    skipped_binary: int = 0
-    skipped_large: int = 0
-    skipped_unreadable: int = 0
+class DiscoveredFile:
+    path: pathlib.Path
+    rel_path: str
 
 
 @dataclass(frozen=True)
@@ -573,86 +376,52 @@ class FileRecord:
     abs_path: str
     size: int
     mtime_ns: int
+    category: str
     language: str
-    importance: int
-    is_binary: bool
-    is_large: bool
-    is_unreadable: bool
-    redacted_text: str | None
+    include: bool
+    reason: str
+    skipped_reason: str | None = None
+    redacted_text: str | None = None
 
 
 @dataclass(frozen=True)
-class InspectionResult:
-    records: list[FileRecord]
-    stats: FileStats
+class Stats:
+    discovered: int = 0
+    included: int = 0
+    skipped_denied_dir: int = 0
+    skipped_denied_name: int = 0
+    skipped_ignored: int = 0
+    skipped_not_allowed: int = 0
+    skipped_binary_or_data: int = 0
+    skipped_lockfile: int = 0
+    skipped_generated: int = 0
+    skipped_large: int = 0
+    skipped_binary_sniff: int = 0
+    skipped_unreadable: int = 0
+    skipped_empty: int = 0
+    skipped_total_cap: int = 0
+    truncated_discovery: bool = False
+
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    files: list[DiscoveredFile]
+    backend: str
+    truncated: bool
+    stats: Stats
 
 
 @dataclass(frozen=True)
 class DumpResult:
     text: str
-    stats: FileStats
-
-
-@dataclass(frozen=True)
-class AIContextResult:
-    text: str
-    used_compact_mode: bool
-    selected_files: int
-
-
-@dataclass(frozen=True)
-class ArtifactSpec:
-    slug: str
-    title: str
-    output_name: str
-    focus: str
-
-
-@dataclass(frozen=True)
-class ArtifactResult:
-    slug: str
-    title: str
-    output_name: str
-    prompt: str
-    text: str
-
-
-@dataclass(frozen=True)
-class AIRequest:
-    prompt: str
-    payload: dict[str, Any]
-    endpoint_url: str
-
-
-@dataclass(frozen=True)
-class AIResponse:
-    text: str
-    raw: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class StageTiming:
+    records: list[FileRecord]
+    stats: Stats
     duration_ms: float
-    status: str
-    meta: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class PipelineResult:
-    return_code: int
-    timings: dict[str, StageTiming]
-    discovery: DiscoveryResult | None = None
-    inspection: InspectionResult | None = None
-    dump: DumpResult | None = None
-    ai_context: AIContextResult | None = None
-    ai_request: AIRequest | None = None
-    ai_response: AIResponse | None = None
-    artifacts: tuple[ArtifactResult, ...] = field(default_factory=tuple)
-
-
-# ============================================================================
+# =============================================================================
 # SMALL HELPERS
-# ============================================================================
+# =============================================================================
 
 
 def log(message: str) -> None:
@@ -678,83 +447,239 @@ def atomic_write_text(path: pathlib.Path, text: str) -> None:
                 pass
 
 
-def atomic_write_json(path: pathlib.Path, data: dict[str, Any]) -> None:
-    atomic_write_text(path, json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+def posix_rel(root: pathlib.Path, path: pathlib.Path) -> str:
+    return path.relative_to(root).as_posix()
 
 
-def normalize_base_url(url: str) -> str:
-    return url.rstrip("/")
+def normalize_rel_path(rel_path: str) -> str:
+    return rel_path.replace("\\", "/").lstrip("/")
 
 
-def posix_rel(config: RuntimeConfig, path: pathlib.Path) -> str:
-    return path.relative_to(config.project_root).as_posix()
+def path_parts(rel_path: str) -> list[str]:
+    return [part for part in normalize_rel_path(rel_path).split("/") if part]
 
 
-def file_language(path: pathlib.Path) -> str:
-    if path.name in SPECIAL_FILENAMES:
-        return SPECIAL_FILENAMES[path.name]
+def file_language(path_or_rel: pathlib.Path | str) -> str:
+    path = pathlib.PurePosixPath(str(path_or_rel).replace("\\", "/"))
+    name = path.name.lower()
+    if name in SPECIAL_LANGUAGE_BY_NAME:
+        return SPECIAL_LANGUAGE_BY_NAME[name]
     return LANGUAGE_BY_SUFFIX.get(path.suffix.lower(), "text")
 
 
+def bump(stats: Stats, field_name: str, amount: int = 1) -> Stats:
+    return replace(stats, **{field_name: getattr(stats, field_name) + amount})
+
+
+def read_text_lossy(path: pathlib.Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+# =============================================================================
+# IGNORE FILES
+# =============================================================================
+
+
 def load_simple_ignore_patterns(project_root: pathlib.Path) -> tuple[str, ...]:
+    """Load simple ignore patterns.
+
+    This is intentionally not a full gitignore engine. It supports the common useful
+    subset for a portable zero-dependency script:
+    - comments and empty lines
+    - leading slash removal
+    - directory patterns ending with /
+    - fnmatch-style globs
+
+    Negated patterns starting with ! are ignored; use .codebasedumpignore for direct control.
+    """
     patterns: list[str] = []
-    for name in (".sumaiignore", ".ignore", ".gitignore"):
+    for name in SIMPLE_IGNORE_FILES:
         ignore_path = project_root / name
         if not ignore_path.exists() or not ignore_path.is_file():
             continue
         try:
-            text = ignore_path.read_text(encoding="utf-8", errors="replace")
+            text = read_text_lossy(ignore_path)
         except OSError:
             continue
         for raw_line in text.splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#") or line.startswith("!"):
                 continue
-            normalized = line.lstrip("/")
+            normalized = normalize_rel_path(line)
             if normalized.endswith("/"):
                 patterns.append(normalized + "**")
-            patterns.append(normalized)
-    return tuple(patterns)
+                patterns.append(normalized.rstrip("/"))
+            else:
+                patterns.append(normalized)
+    return tuple(dict.fromkeys(patterns))
 
 
-def build_runtime_config(project_root: pathlib.Path = PROJECT_ROOT) -> RuntimeConfig:
-    root = pathlib.Path(project_root).resolve()
-    return RuntimeConfig(project_root=root, simple_ignore_patterns=load_simple_ignore_patterns(root))
-
-
-def matches_any_glob(rel_path: str, patterns: tuple[str, ...]) -> bool:
-    if not patterns:
-        return False
-    name = rel_path.rsplit("/", 1)[-1]
-    return any(fnmatch.fnmatch(rel_path, pattern) or fnmatch.fnmatch(name, pattern) for pattern in patterns)
-
-
-def should_skip_path(config: RuntimeConfig, rel_path: str, is_dir: bool) -> bool:
-    if not rel_path:
-        return False
-
-    name = rel_path.rsplit("/", 1)[-1]
-    if is_dir and (name in EXCLUDED_DIR_NAMES or rel_path == config.artifact_dir_name):
-        return True
-    if not is_dir and name in EXCLUDED_FILE_NAMES:
-        return True
-    if matches_any_glob(rel_path, config.simple_ignore_patterns):
-        return True
-
-    if not is_dir:
-        lower_name = name.lower()
-        lower_rel = rel_path.lower()
-        if any(lower_name.endswith(suffix) for suffix in EXCLUDED_SUFFIXES):
+def matches_any_glob(rel_path: str, patterns: Iterable[str]) -> bool:
+    rel = normalize_rel_path(rel_path)
+    name = rel.rsplit("/", 1)[-1]
+    for pattern in patterns:
+        normalized = normalize_rel_path(pattern)
+        if fnmatch.fnmatch(rel, normalized) or fnmatch.fnmatch(name, normalized):
             return True
-        if matches_any_glob(lower_name, tuple(EXCLUDED_GLOBS)) or matches_any_glob(lower_rel, tuple(EXCLUDED_GLOBS)):
-            return True
-
     return False
 
 
-# ============================================================================
+# =============================================================================
+# PATH CLASSIFICATION
+# =============================================================================
+
+
+def has_denied_dir(rel_path: str) -> str | None:
+    for part in path_parts(rel_path)[:-1]:
+        if part.lower() in EXCLUDED_DIR_NAMES:
+            return part
+    return None
+
+
+def is_hidden_noise_file(rel_path: str) -> bool:
+    # Keep important dotfiles such as .gitignore/.editorconfig, but reject random hidden files.
+    name = pathlib.PurePosixPath(rel_path).name
+    lower = name.lower()
+    if not name.startswith("."):
+        return False
+    if lower in IMPORTANT_CONFIG_FILENAMES or lower in TEXT_LIKE_FILENAMES:
+        return False
+    if lower.startswith(".env"):
+        return True
+    if lower in {".ds_store", ".coverage"}:
+        return True
+    # Hidden source files are rare; hidden configs are allowed only by explicit allowlist.
+    return lower not in IMPORTANT_CONFIG_FILENAMES
+
+
+def has_generated_suffix_or_name(rel_path: str) -> bool:
+    lower = rel_path.lower()
+    name = lower.rsplit("/", 1)[-1]
+    if any(lower.endswith(suffix) for suffix in GENERATED_SUFFIXES):
+        return True
+    return matches_any_glob(name, GENERATED_GLOBS) or matches_any_glob(lower, GENERATED_GLOBS)
+
+
+def is_dump_artifact(rel_path: str) -> bool:
+    lower = normalize_rel_path(rel_path).lower()
+    name = lower.rsplit("/", 1)[-1]
+    return matches_any_glob(name, {pattern.lower() for pattern in DUMP_ARTIFACT_GLOBS})
+
+
+def looks_like_named_config(rel_path: str) -> bool:
+    lower = normalize_rel_path(rel_path).lower()
+    name = lower.rsplit("/", 1)[-1]
+    suffix = pathlib.PurePosixPath(name).suffix
+    if suffix not in CONFIG_SUFFIXES:
+        return False
+    config_globs = {
+        "config_*.*", "*_config.*", "*.config.*",
+        "settings.*", "settings_*.*", "*_settings.*",
+        "model.*", "model_*.*", "*_model.*",
+        "models.*", "llm.*", "llm_*.*", "*_llm.*",
+    }
+    return matches_any_glob(name, config_globs)
+
+
+def looks_like_manual_text(rel_path: str) -> bool:
+    lower = normalize_rel_path(rel_path).lower()
+    name = lower.rsplit("/", 1)[-1]
+    return pathlib.PurePosixPath(name).suffix == ".txt" and matches_any_glob(name, MANUAL_TEXT_GLOBS)
+
+
+def looks_like_important_config(rel_path: str) -> bool:
+    lower = normalize_rel_path(rel_path).lower()
+    name = lower.rsplit("/", 1)[-1]
+    parts = set(path_parts(lower))
+
+    if name in IMPORTANT_CONFIG_FILENAMES:
+        return True
+    if lower in IMPORTANT_CONFIG_FILENAMES:
+        return True
+    if lower.startswith(".github/workflows/") and pathlib.PurePosixPath(lower).suffix in {".yml", ".yaml"}:
+        return True
+    if looks_like_named_config(rel_path):
+        return True
+    if parts & IMPORTANT_CONFIG_PATH_PARTS:
+        return True
+    return False
+
+
+def classify_path(config: RuntimeConfig, rel_path: str) -> IncludeDecision:
+    rel = normalize_rel_path(rel_path)
+    lower = rel.lower()
+    name = lower.rsplit("/", 1)[-1]
+    pure = pathlib.PurePosixPath(lower)
+    suffix = pure.suffix
+
+    denied_dir = has_denied_dir(rel)
+    if denied_dir:
+        return IncludeDecision(False, "denied_dir", "text", f"denied directory: {denied_dir}")
+
+    if name == config.script_name.lower() or name == config.output_name.lower() or name in EXCLUDED_FILE_NAMES:
+        return IncludeDecision(False, "denied_name", "text", "denied filename")
+
+    if is_dump_artifact(rel):
+        return IncludeDecision(False, "denied_name", "text", "old dump/context artifact")
+
+    if matches_any_glob(lower, config.simple_ignore_patterns):
+        return IncludeDecision(False, "ignored", "text", "matched ignore pattern")
+
+    if name in ENV_TEMPLATE_FILENAMES:
+        return IncludeDecision(True, "config", file_language(rel), "environment template file", MAX_CONFIG_FILE_BYTES)
+
+    if name in SECRET_FILENAMES or name.startswith(".env"):
+        return IncludeDecision(False, "secret_file", "text", "secret/env file")
+
+    if not config.include_hidden_files and is_hidden_noise_file(rel):
+        return IncludeDecision(False, "hidden", "text", "hidden file")
+    if is_hidden_noise_file(rel):
+        return IncludeDecision(False, "hidden_noise", "text", "hidden noise file")
+
+    if name in LOCK_FILENAMES:
+        if config.include_lockfiles:
+            return IncludeDecision(True, "lockfile", file_language(rel), "lockfile included by flag", MAX_CONFIG_FILE_BYTES)
+        return IncludeDecision(False, "lockfile", "text", "lockfile skipped by default")
+
+    if suffix in BINARY_OR_DATA_SUFFIXES or any(lower.endswith(s) for s in BINARY_OR_DATA_SUFFIXES):
+        return IncludeDecision(False, "binary_or_data", "text", f"binary/data suffix: {suffix or name}")
+
+    if matches_any_glob(name, NOISY_TEXT_GLOBS) or matches_any_glob(lower, NOISY_TEXT_GLOBS):
+        return IncludeDecision(False, "noisy_text", "text", "noisy text artifact")
+
+    if has_generated_suffix_or_name(rel) and not config.include_generated:
+        return IncludeDecision(False, "generated", file_language(rel), "generated filename pattern")
+
+    language = file_language(rel)
+
+    if suffix in CODE_SUFFIXES:
+        return IncludeDecision(True, "code", language, f"source code suffix: {suffix}", MAX_CODE_FILE_BYTES)
+
+    if suffix in DOC_SUFFIXES:
+        return IncludeDecision(True, "docs", language, f"documentation suffix: {suffix}", MAX_DOC_FILE_BYTES)
+
+    if suffix in SCHEMA_SUFFIXES:
+        return IncludeDecision(True, "schema", language, f"schema suffix: {suffix}", MAX_SCHEMA_FILE_BYTES)
+
+    if name in TEXT_LIKE_FILENAMES or looks_like_manual_text(rel):
+        return IncludeDecision(True, "docs", "text", "important/manual text file", MAX_TEXT_FILE_BYTES)
+
+    if name in IMPORTANT_CONFIG_FILENAMES or lower in IMPORTANT_CONFIG_FILENAMES:
+        return IncludeDecision(True, "config", language, "important config filename", MAX_CONFIG_FILE_BYTES)
+
+    if suffix in CONFIG_SUFFIXES:
+        if config.include_all_configs:
+            return IncludeDecision(True, "config", language, f"config suffix via --include-all-configs: {suffix}", MAX_CONFIG_FILE_BYTES)
+        if looks_like_important_config(rel):
+            return IncludeDecision(True, "config", language, "important config path/name", MAX_CONFIG_FILE_BYTES)
+        return IncludeDecision(False, "not_allowed", language, "generic config not on allowlist")
+
+    return IncludeDecision(False, "not_allowed", language, "not source/docs/schema/important config")
+
+
+# =============================================================================
 # FILE DISCOVERY
-# ============================================================================
+# =============================================================================
 
 
 def git_available(config: RuntimeConfig) -> bool:
@@ -806,43 +731,45 @@ def collect_files_with_git(config: RuntimeConfig) -> DiscoveryResult:
         error_text = proc.stderr.decode("utf-8", errors="replace").strip() or "git ls-files failed"
         raise RuntimeError(error_text)
 
-    files: list[pathlib.Path] = []
+    files: list[DiscoveredFile] = []
+    stats = Stats()
     truncated = False
+
     for raw_item in (item for item in proc.stdout.split(b"\x00") if item):
-        rel = raw_item.decode("utf-8", errors="replace").replace("\\", "/")
-        if should_skip_path(config, rel, is_dir=False):
-            continue
+        rel = normalize_rel_path(raw_item.decode("utf-8", errors="replace"))
+        stats = bump(stats, "discovered")
         path = config.project_root / rel
         if not path.exists() or not path.is_file() or path.is_symlink():
             continue
-        files.append(path)
+        files.append(DiscoveredFile(path=path, rel_path=rel))
         if len(files) >= config.max_tree_files:
             truncated = True
             break
 
-    files = sorted(files, key=lambda item: posix_rel(config, item))
-    return DiscoveryResult(files=files, backend="git", truncated=truncated)
+    files.sort(key=lambda item: item.rel_path)
+    return DiscoveryResult(files=files, backend="git", truncated=truncated, stats=replace(stats, truncated_discovery=truncated))
 
 
 def walk_with_scandir(config: RuntimeConfig) -> DiscoveryResult:
-    results: list[pathlib.Path] = []
+    files: list[DiscoveredFile] = []
+    stats = Stats()
     truncated = False
 
     def visit(directory: pathlib.Path) -> None:
-        nonlocal truncated
+        nonlocal stats, truncated
         try:
             entries = sorted(os.scandir(directory), key=lambda entry: entry.name.lower())
         except OSError:
             return
 
         for entry in entries:
-            if len(results) >= config.max_tree_files:
+            if len(files) >= config.max_tree_files:
                 truncated = True
                 return
 
             entry_path = pathlib.Path(entry.path)
             try:
-                rel = entry_path.relative_to(config.project_root).as_posix()
+                rel = posix_rel(config.project_root, entry_path)
             except ValueError:
                 continue
 
@@ -850,18 +777,23 @@ def walk_with_scandir(config: RuntimeConfig) -> DiscoveryResult:
                 continue
 
             if entry.is_dir(follow_symlinks=False):
-                if should_skip_path(config, rel, is_dir=True):
+                if entry.name.lower() in EXCLUDED_DIR_NAMES:
+                    # Count this as one denied directory; we intentionally do not enumerate children.
+                    stats = bump(stats, "skipped_denied_dir")
+                    continue
+                if matches_any_glob(rel, config.simple_ignore_patterns):
+                    stats = bump(stats, "skipped_ignored")
                     continue
                 visit(entry_path)
                 continue
 
             if entry.is_file(follow_symlinks=False):
-                if should_skip_path(config, rel, is_dir=False):
-                    continue
-                results.append(entry_path)
+                stats = bump(stats, "discovered")
+                files.append(DiscoveredFile(path=entry_path, rel_path=normalize_rel_path(rel)))
 
     visit(config.project_root)
-    return DiscoveryResult(files=results, backend="filesystem", truncated=truncated)
+    files.sort(key=lambda item: item.rel_path)
+    return DiscoveryResult(files=files, backend="filesystem", truncated=truncated, stats=replace(stats, truncated_discovery=truncated))
 
 
 def discover_project_files(config: RuntimeConfig, logger: Callable[[str], None] | None = None) -> DiscoveryResult:
@@ -872,13 +804,13 @@ def discover_project_files(config: RuntimeConfig, logger: Callable[[str], None] 
                 return result
         except Exception as exc:
             if logger:
-                logger(f"[sumai] Git discovery failed, falling back to filesystem scan: {exc}")
+                logger(f"[codebase-dump] Git discovery failed, falling back to filesystem scan: {exc}")
     return walk_with_scandir(config)
 
 
-# ============================================================================
-# FILE INSPECTION
-# ============================================================================
+# =============================================================================
+# TEXT / REDACTION / GENERATED DETECTION
+# =============================================================================
 
 
 def is_probably_binary_bytes(chunk: bytes) -> bool:
@@ -899,10 +831,93 @@ def decode_text_bytes(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def redact_sensitive_text(text: str) -> str:
+def strip_wrapping_quotes(value: str) -> str:
+    stripped = value.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {'\"', "'"}:
+        return stripped[1:-1]
+    return stripped
+
+
+def looks_like_secret_value(value: str) -> bool:
+    candidate = strip_wrapping_quotes(value).strip()
+    if not candidate:
+        return False
+
+    lowered = candidate.lower()
+    if lowered in {"true", "false", "none", "null", "yes", "no"}:
+        return False
+
+    if JWT_LIKE_RE.search(candidate):
+        return True
+
+    # Known token formats are also handled by INLINE_SECRET_PATTERNS, but this
+    # catches them before preserving comments/quotes in env-like lines.
+    known_prefixes = (
+        "sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "glpat-",
+        "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "akia", "aiza", "ya29.",
+    )
+    if lowered.startswith(known_prefixes):
+        return True
+
+    # Conservative high-entropy heuristic for env values only. Avoid redacting
+    # normal paths, URLs without credentials, numbers, booleans, and readable text.
+    if len(candidate) < 32:
+        return False
+    if any(sep in candidate for sep in ("\\", "/", " ", "\t")):
+        return False
+    has_alpha = bool(re.search(r"[A-Za-z]", candidate))
+    has_digit = bool(re.search(r"\d", candidate))
+    has_token_char = bool(re.search(r"[-_=+.]", candidate))
+    return has_alpha and has_digit and has_token_char
+
+
+def redacted_env_value(original_value: str) -> str:
+    stripped = original_value.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {'\"', "'"}:
+        quote = stripped[0]
+        leading = original_value[: len(original_value) - len(original_value.lstrip())]
+        trailing = original_value[len(original_value.rstrip()):]
+        return f"{leading}{quote}[REDACTED]{quote}{trailing}"
+    return "[REDACTED]"
+
+
+def redact_env_like_assignments(text: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        prefix, name, eq, value = match.groups()
+        # Preserve pure comments and harmless empty placeholders.
+        if not value.strip():
+            return match.group(0)
+        if ENV_SECRET_NAME_RE.search(name) or looks_like_secret_value(value):
+            return f"{prefix}{name}{eq}{redacted_env_value(value)}"
+        return match.group(0)
+
+    return ENV_ASSIGNMENT_RE.sub(repl, text)
+
+
+def looks_like_runtime_secret_reference(value_token: str) -> bool:
+    token = value_token.strip().lower()
+    if not token:
+        return False
+    runtime_prefixes = (
+        "os.getenv(", "getenv(", "os.environ", "environ.get(",
+        "process.env", "system.getenv(", "settings.", "config.",
+        "none", "null", "true", "false", "os.getenv", "getenv",
+    )
+    return token.startswith(runtime_prefixes)
+
+
+def redact_unquoted_sensitive_assignment(match: re.Match[str]) -> str:
+    prefix = match.group(1)
+    value_token = match.group(2)
+    if looks_like_runtime_secret_reference(value_token):
+        return match.group(0)
+    return f"{prefix}[REDACTED]"
+
+
+def redact_sensitive_text(text: str, *, env_like: bool = False) -> str:
     redacted = PRIVATE_KEY_BLOCK_RE.sub("[REDACTED PRIVATE KEY BLOCK]", text)
     redacted = SENSITIVE_QUOTED_ASSIGNMENT_RE.sub(r"\1[REDACTED]\3", redacted)
-    redacted = SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(redact_unquoted_sensitive_assignment, redacted)
     for pattern in INLINE_SECRET_PATTERNS:
         redacted = pattern.sub(
             lambda match: (match.group(1) + "[REDACTED]" + match.group(3))
@@ -910,124 +925,140 @@ def redact_sensitive_text(text: str) -> str:
             else "[REDACTED]",
             redacted,
         )
-    return redacted
+    return redact_env_like_assignments(redacted) if env_like else redacted
 
 
-def importance_score(rel_path: str) -> int:
-    score = 0
-    for pattern, delta in IMPORTANCE_PATTERNS:
-        if re.search(pattern, rel_path):
-            score += delta
-    depth = rel_path.count("/")
-    score -= depth * 2
-    extension = pathlib.Path(rel_path).suffix.lower()
-    if extension in {".md", ".py", ".ts", ".tsx", ".js", ".jsx", ".toml", ".json", ".yaml", ".yml"}:
-        score += 4
-    return score
+def looks_generated_by_content(text: str) -> bool:
+    head = text[:8_000].lower()
+    return any(marker in head for marker in GENERATED_CONTENT_MARKERS)
 
 
-def inspect_single_file(config: RuntimeConfig, path: pathlib.Path) -> FileRecord:
-    rel_path = posix_rel(config, path)
-    stat = path.stat()
-    size = stat.st_size
-    mtime_ns = stat.st_mtime_ns
+# =============================================================================
+# INSPECTION
+# =============================================================================
 
-    language = file_language(path)
-    record = FileRecord(
-        rel_path=rel_path,
-        abs_path=str(path),
-        size=size,
-        mtime_ns=mtime_ns,
-        language=language,
-        importance=importance_score(rel_path),
-        is_binary=False,
-        is_large=False,
-        is_unreadable=False,
-        redacted_text=None,
-    )
 
-    if size > config.max_file_bytes:
-        record = replace(record, is_large=True)
-        return record
+def inspect_single_file(config: RuntimeConfig, item: DiscoveredFile) -> FileRecord:
+    decision = classify_path(config, item.rel_path)
+    rel_path = item.rel_path
 
     try:
-        raw = path.read_bytes()
+        stat = item.path.stat()
+        size = stat.st_size
+        mtime_ns = stat.st_mtime_ns
     except OSError:
-        record = replace(record, is_unreadable=True)
-        return record
+        return FileRecord(
+            rel_path=rel_path,
+            abs_path=str(item.path),
+            size=0,
+            mtime_ns=0,
+            category=decision.category,
+            language=decision.language,
+            include=False,
+            reason=decision.reason,
+            skipped_reason="unreadable stat",
+        )
 
-    if is_probably_binary_bytes(raw[: config.binary_sniff_bytes]):
-        record = replace(record, is_binary=True)
-        return record
+    base = FileRecord(
+        rel_path=rel_path,
+        abs_path=str(item.path),
+        size=size,
+        mtime_ns=mtime_ns,
+        category=decision.category,
+        language=decision.language,
+        include=decision.include,
+        reason=decision.reason,
+    )
 
-    text = redact_sensitive_text(decode_text_bytes(raw))
-    record = replace(record, redacted_text=text)
-    return record
+    if not decision.include:
+        return replace(base, skipped_reason=decision.reason)
+
+    if size == 0:
+        return replace(base, include=False, skipped_reason="empty file")
+
+    if size > decision.max_bytes:
+        return replace(base, include=False, skipped_reason=f"file too large: {size} > {decision.max_bytes} bytes")
+
+    try:
+        raw = item.path.read_bytes()
+    except OSError:
+        return replace(base, include=False, skipped_reason="unreadable file")
+
+    if is_probably_binary_bytes(raw[:BINARY_SNIFF_BYTES]):
+        return replace(base, include=False, skipped_reason="binary sniff")
+
+    text = decode_text_bytes(raw)
+
+    if not config.include_generated and looks_generated_by_content(text):
+        return replace(base, include=False, skipped_reason="generated content marker")
+
+    env_like = pathlib.PurePosixPath(rel_path.lower()).name in ENV_TEMPLATE_FILENAMES
+    return replace(base, redacted_text=redact_sensitive_text(text, env_like=env_like))
 
 
-def inspect_project_files(config: RuntimeConfig, discovery: DiscoveryResult) -> InspectionResult:
+def update_stats_from_record(stats: Stats, record: FileRecord) -> Stats:
+    if record.include:
+        return bump(stats, "included")
+
+    reason = (record.skipped_reason or record.reason or "").lower()
+    category = record.category
+
+    if category == "denied_dir" or "denied directory" in reason:
+        return bump(stats, "skipped_denied_dir")
+    if category in {"denied_name", "secret_file", "hidden_noise"} or "denied filename" in reason:
+        return bump(stats, "skipped_denied_name")
+    if category == "ignored" or "ignore pattern" in reason:
+        return bump(stats, "skipped_ignored")
+    if category == "lockfile":
+        return bump(stats, "skipped_lockfile")
+    if category == "generated" or "generated" in reason:
+        return bump(stats, "skipped_generated")
+    if category == "binary_or_data" or "binary/data" in reason:
+        return bump(stats, "skipped_binary_or_data")
+    if "too large" in reason:
+        return bump(stats, "skipped_large")
+    if "binary sniff" in reason:
+        return bump(stats, "skipped_binary_sniff")
+    if "unreadable" in reason:
+        return bump(stats, "skipped_unreadable")
+    if "empty" in reason:
+        return bump(stats, "skipped_empty")
+    return bump(stats, "skipped_not_allowed")
+
+
+def inspect_project_files(config: RuntimeConfig, discovery: DiscoveryResult) -> tuple[list[FileRecord], Stats]:
     records: list[FileRecord] = []
-    stats = FileStats()
+    stats = discovery.stats
     seen: set[str] = set()
 
-    for path in discovery.files:
-        rel_path = posix_rel(config, path)
-        if rel_path in seen:
+    for item in discovery.files:
+        if item.rel_path in seen:
             continue
-        seen.add(rel_path)
-
-        try:
-            stat = path.stat()
-        except OSError:
-            record = FileRecord(
-                rel_path=rel_path,
-                abs_path=str(path),
-                size=0,
-                mtime_ns=0,
-                language=file_language(path),
-                importance=importance_score(rel_path),
-                is_binary=False,
-                is_large=False,
-                is_unreadable=True,
-                redacted_text=None,
-            )
-            stats = replace(stats, skipped_unreadable=stats.skipped_unreadable + 1)
-            records.append(record)
-            continue
-
-        record = inspect_single_file(config, path)
-
-        if record.is_binary:
-            stats = replace(stats, skipped_binary=stats.skipped_binary + 1)
-        elif record.is_large:
-            stats = replace(stats, skipped_large=stats.skipped_large + 1)
-        elif record.is_unreadable:
-            stats = replace(stats, skipped_unreadable=stats.skipped_unreadable + 1)
-        else:
-            stats = replace(stats, included=stats.included + 1)
-
+        seen.add(item.rel_path)
+        record = inspect_single_file(config, item)
+        stats = update_stats_from_record(stats, record)
         records.append(record)
 
-    records.sort(key=lambda item: item.rel_path)
-    return InspectionResult(records=records, stats=stats)
+    records.sort(key=lambda record: record.rel_path)
+    return records, stats
 
 
-# ============================================================================
-# REPOSITORY SHAPE + DUMP RENDERING
-# ============================================================================
+# =============================================================================
+# RENDERING
+# =============================================================================
 
 
-def build_tree(config: RuntimeConfig, paths: list[pathlib.Path]) -> str:
-    tree: dict[str, dict[str, Any]] = {}
-    for path in paths:
+def build_tree(project_name: str, rel_paths: Iterable[str]) -> str:
+    tree: dict[str, dict] = {}
+    for rel_path in rel_paths:
         node = tree
-        for part in posix_rel(config, path).split("/"):
+        for part in path_parts(rel_path):
             node = node.setdefault(part, {})
 
-    lines = [config.project_root.name + "/"]
+    lines = [project_name + "/"]
 
-    def render(node: dict[str, Any], prefix: str = "") -> None:
-        names = sorted(node.keys())
+    def render(node: dict[str, dict], prefix: str = "") -> None:
+        names = sorted(node.keys(), key=str.lower)
         for index, name in enumerate(names):
             is_last = index == len(names) - 1
             connector = "└── " if is_last else "├── "
@@ -1039,1327 +1070,214 @@ def build_tree(config: RuntimeConfig, paths: list[pathlib.Path]) -> str:
     return "\n".join(lines)
 
 
-def render_dump(config: RuntimeConfig, discovery: DiscoveryResult, inspection: InspectionResult) -> DumpResult:
-    tree = build_tree(config, discovery.files)
-    parts = [
+def render_stats(stats: Stats, backend: str, records: list[FileRecord]) -> list[str]:
+    skipped_total = len([record for record in records if not record.include])
+    return [
+        f"- Discovery backend: `{backend}`",
+        f"- Files discovered: {stats.discovered}",
+        f"- Files included: {stats.included}",
+        f"- Files skipped: {skipped_total}",
+        f"- Skipped denied directories: {stats.skipped_denied_dir}",
+        f"- Skipped denied names/secrets/hidden noise: {stats.skipped_denied_name}",
+        f"- Skipped by ignore patterns: {stats.skipped_ignored}",
+        f"- Skipped not allowed by whitelist: {stats.skipped_not_allowed}",
+        f"- Skipped binary/data suffixes: {stats.skipped_binary_or_data}",
+        f"- Skipped lockfiles: {stats.skipped_lockfile}",
+        f"- Skipped generated files: {stats.skipped_generated}",
+        f"- Skipped large files: {stats.skipped_large}",
+        f"- Skipped binary sniff: {stats.skipped_binary_sniff}",
+        f"- Skipped unreadable: {stats.skipped_unreadable}",
+        f"- Skipped empty: {stats.skipped_empty}",
+        f"- Skipped due to total dump cap: {stats.skipped_total_cap}",
+        f"- Discovery truncated: {stats.truncated_discovery}",
+    ]
+
+
+def render_explain_section(records: list[FileRecord]) -> str:
+    lines = ["## File Decisions", ""]
+    for record in records:
+        status = "INCLUDE" if record.include else "SKIP"
+        reason = record.reason if record.include else (record.skipped_reason or record.reason)
+        size = f"{record.size} bytes"
+        lines.append(f"- {status}: `{record.rel_path}` — {record.category}; {reason}; {size}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_skipped_section(records: list[FileRecord]) -> str:
+    skipped = [record for record in records if not record.include]
+    if not skipped:
+        return "## Skipped Files\n\n- None.\n"
+
+    lines = ["## Skipped Files", ""]
+    for record in skipped:
+        reason = record.skipped_reason or record.reason
+        lines.append(f"- `{record.rel_path}` — {reason}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def markdown_fence_for_text(text: str) -> str:
+    """Return a fence longer than any backtick run inside the file content."""
+    longest = 0
+    for match in re.finditer(r"`+", text):
+        longest = max(longest, len(match.group(0)))
+    return "`" * max(3, longest + 1)
+
+
+def render_file_section(record: FileRecord) -> str:
+    text = record.redacted_text or ""
+    fence = markdown_fence_for_text(text)
+    language = record.language or "text"
+    return "\n".join([
+        f"### {record.rel_path}",
+        "",
+        f"{fence}{language}",
+        text,
+        fence,
+        "",
+    ])
+
+
+def render_dump(config: RuntimeConfig, discovery: DiscoveryResult, records: list[FileRecord], stats: Stats) -> tuple[str, Stats]:
+    included_records = [record for record in records if record.include]
+    tree_paths = [record.rel_path for record in included_records]
+    project_name = config.project_root.name or "project"
+
+    parts: list[str] = [
         "# CodebaseDump",
         "",
         f"- Generated: {now_iso()}",
-        f"- Project root: `{config.project_root}`",
-        f"- Discovery backend: `{discovery.backend}`",
-        f"- Files discovered: {len(discovery.files)}",
-        f"- Included text files: {inspection.stats.included}",
-        f"- Skipped binary: {inspection.stats.skipped_binary}",
-        f"- Skipped large: {inspection.stats.skipped_large}",
-        f"- Skipped unreadable: {inspection.stats.skipped_unreadable}",
+        f"- Generator: SumAi CodebaseDump v{GENERATOR_VERSION}",
+        f"- Project: `{project_name}`",
+    ]
+    parts.extend(render_stats(stats, discovery.backend, records))
+    parts.extend([
         "",
         "## Repository Tree",
         "",
         "```text",
-        tree,
+        build_tree(project_name, tree_paths),
         "```",
         "",
         "## Files",
         "",
-    ]
-
-    for record in inspection.records:
-        if record.is_binary:
-            parts.extend([f"### {record.rel_path}", "", "Skipped: binary file.", ""])
-            continue
-        if record.is_large:
-            parts.extend([f"### {record.rel_path}", "", f"Skipped: file is larger than {config.max_file_bytes} bytes.", ""])
-            continue
-        if record.is_unreadable:
-            parts.extend([f"### {record.rel_path}", "", "Skipped: unreadable file.", ""])
-            continue
-        parts.extend([
-            f"### {record.rel_path}",
-            "",
-            f"```{record.language}",
-            record.redacted_text or "",
-            "```",
-            "",
-        ])
-
-    return DumpResult(text="\n".join(parts).rstrip() + "\n", stats=inspection.stats)
-
-
-# ============================================================================
-# AI CONTEXT + PROMPT
-# ============================================================================
-
-
-def normalize_ai_context_text(text: str) -> str:
-    normalized_lines = []
-    volatile_prefixes = (
-        '- Generated: ',
-        '- File cache hits: ',
-        '- File cache misses: ',
-    )
-    for line in text.splitlines():
-        if line.startswith(volatile_prefixes):
-            continue
-        normalized_lines.append(line)
-    return "\n".join(normalized_lines).strip() + "\n"
-
-
-def dedupe_preserve_order(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in items:
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        result.append(item)
-    return result
-
-
-def is_doc_like_path(rel_path: str) -> bool:
-    lower = rel_path.lower()
-    name = lower.rsplit('/', 1)[-1]
-    stem = pathlib.PurePosixPath(name).stem
-    return (
-        lower.endswith('.md')
-        or lower.startswith('docs/')
-        or '/docs/' in lower
-        or stem in {'readme', 'changelog', 'license', 'contributing', 'authors', 'notes'}
-    )
-
-
-def is_benchmark_like_path(rel_path: str) -> bool:
-    lower = rel_path.lower()
-    name = lower.rsplit('/', 1)[-1]
-    return 'benchmark' in lower or name in {'benchmark_results.json', 'profile.json'}
-
-
-def is_test_like_path(rel_path: str) -> bool:
-    lower = rel_path.lower()
-    name = lower.rsplit('/', 1)[-1]
-    return (
-        lower.startswith('tests/')
-        or '/tests/' in lower
-        or name.startswith('test_')
-        or name.endswith('_test.py')
-        or name.endswith('.spec.ts')
-        or name.endswith('.spec.js')
-        or name.endswith('.test.ts')
-        or name.endswith('.test.js')
-    )
-
-
-def is_config_like_path(rel_path: str, text: str) -> bool:
-    lower = rel_path.lower()
-    if (
-        lower.startswith('config/')
-        or '/config/' in lower
-        or re.search(r'(^|/)(config|settings|env)(\.[^/]+)?$', lower)
-        or lower.endswith('.env')
-        or lower.endswith('.ini')
-        or lower.endswith('.toml')
-        or lower.endswith('.yaml')
-        or lower.endswith('.yml')
-        or lower.endswith('.json')
-    ):
-        return True
-    constant_names = re.findall(r'(?m)^([A-Z][A-Z0-9_]{2,})\s*=', text)
-    return len(constant_names) >= 3
-
-
-def python_module_aliases(rel_path: str) -> list[str]:
-    pure = pathlib.PurePosixPath(rel_path)
-    if pure.suffix != '.py':
-        return []
-
-    parts = list(pure.parts)
-    if not parts:
-        return []
-
-    if parts[-1] == '__init__.py':
-        module_parts = parts[:-1]
-    else:
-        module_parts = parts[:-1] + [pure.stem]
-
-    aliases: list[str] = []
-    for start in range(len(module_parts)):
-        alias = '.'.join(module_parts[start:])
-        if alias:
-            aliases.append(alias)
-    if module_parts:
-        aliases.append(module_parts[-1])
-    return dedupe_preserve_order(aliases)
-
-
-def call_name_from_ast(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        parts: list[str] = []
-        current: ast.AST | None = node
-        while isinstance(current, ast.Attribute):
-            parts.append(current.attr)
-            current = current.value
-        if isinstance(current, ast.Name):
-            parts.append(current.id)
-            return '.'.join(reversed(parts))
-    return None
-
-
-def is_python_main_guard(test: ast.AST) -> bool:
-    if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
-        return False
-    left = test.left
-    right = test.comparators[0]
-    if not isinstance(left, ast.Name) or left.id != '__name__':
-        return False
-    if not isinstance(right, ast.Constant) or right.value != '__main__':
-        return False
-    return isinstance(test.ops[0], ast.Eq)
-
-
-def extract_python_outline(text: str) -> dict[str, Any]:
-    info: dict[str, Any] = {
-        'functions': [],
-        'classes': [],
-        'imports': [],
-        'main_guard_calls': [],
-        'main_function_calls': [],
-        'constants': [],
-        'dataclass_classes': [],
-        'has_main_guard': False,
-        'has_dispatcher_pattern': False,
-    }
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        return info
-
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            info['functions'].append(node.name)
-            if node.name == 'main':
-                calls: list[str] = []
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Call):
-                        name = call_name_from_ast(child.func)
-                        if name:
-                            calls.append(name)
-                info['main_function_calls'] = dedupe_preserve_order(calls)[:8]
-        elif isinstance(node, ast.ClassDef):
-            info['classes'].append(node.name)
-            decorator_names = {call_name_from_ast(decorator) for decorator in node.decorator_list}
-            if 'dataclass' in decorator_names:
-                info['dataclass_classes'].append(node.name)
-        elif isinstance(node, ast.Import):
-            info['imports'].extend(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                info['imports'].append(node.module)
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and re.match(r'^[A-Z][A-Z0-9_]{2,}$', target.id):
-                    info['constants'].append(target.id)
-        elif isinstance(node, ast.If) and is_python_main_guard(node.test):
-            info['has_main_guard'] = True
-            calls: list[str] = []
-            for child in ast.walk(node):
-                if isinstance(child, ast.Call):
-                    name = call_name_from_ast(child.func)
-                    if name:
-                        calls.append(name)
-            info['main_guard_calls'] = dedupe_preserve_order(calls)[:8]
-
-    text_lower = text.lower()
-    if (
-        re.search(r'(?m)^\s*def\s+(handle_request|dispatch|route_command|run_command)\b', text)
-        or ('command =' in text_lower and 'elif command ==' in text_lower)
-        or ('args[0]' in text and 'return' in text_lower)
-    ):
-        info['has_dispatcher_pattern'] = True
-
-    info['functions'] = dedupe_preserve_order(info['functions'])[:10]
-    info['classes'] = dedupe_preserve_order(info['classes'])[:10]
-    info['imports'] = dedupe_preserve_order(info['imports'])[:16]
-    info['constants'] = dedupe_preserve_order(info['constants'])[:16]
-    info['dataclass_classes'] = dedupe_preserve_order(info['dataclass_classes'])[:8]
-    return info
-
-
-def extract_js_ts_outline(text: str) -> tuple[list[str], list[str]]:
-    exports = re.findall(r"(?m)^\s*export\s+(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)", text)
-    exports += re.findall(r"(?m)^\s*export\s+(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)", text)
-    classes = re.findall(r"(?m)^\s*export\s+class\s+([A-Za-z_][A-Za-z0-9_]*)", text)
-    return dedupe_preserve_order(exports)[:8], dedupe_preserve_order(classes)[:8]
-
-
-def extract_env_var_names(text: str) -> list[str]:
-    patterns = [
-        r'os\.environ\.get\(["\']([A-Z][A-Z0-9_]{1,})["\']',
-        r'os\.getenv\(["\']([A-Z][A-Z0-9_]{1,})["\']',
-        r'getenv\(["\']([A-Z][A-Z0-9_]{1,})["\']',
-        r'process\.env\.([A-Z][A-Z0-9_]{1,})',
-        r'process\.env\[["\']([A-Z][A-Z0-9_]{1,})["\']\]',
-        r'System\.getenv\(["\']([A-Z][A-Z0-9_]{1,})["\']',
-    ]
-    env_vars: list[str] = []
-    for pattern in patterns:
-        env_vars.extend(re.findall(pattern, text))
-    return dedupe_preserve_order(env_vars)[:30]
-
-
-def summarize_record_for_context(record: FileRecord) -> dict[str, Any]:
-    rel_path = record.rel_path
-    rel_lower = rel_path.lower()
-    text = record.redacted_text or ''
-
-    roles: list[str] = []
-    reasons: list[str] = []
-    functions: list[str] = []
-    classes: list[str] = []
-    imports: list[str] = []
-    exports: list[str] = []
-    main_calls: list[str] = []
-    constants: list[str] = []
-    dataclass_classes: list[str] = []
-
-    is_doc = is_doc_like_path(rel_path)
-    is_benchmark = is_benchmark_like_path(rel_path)
-    is_test = is_test_like_path(rel_path)
-    is_config = is_config_like_path(rel_path, text)
-
-    if is_doc:
-        roles.append('doc')
-        reasons.append('documentation file')
-    if is_benchmark:
-        roles.append('benchmark')
-        reasons.append('benchmark or measurement file')
-    if is_test:
-        roles.append('test')
-        reasons.append('test surface')
-    if is_config:
-        roles.append('config')
-        reasons.append('config surface')
-
-    if re.search(r'(^|/)(utils?|helpers?)\.[a-z0-9]+$', rel_lower):
-        roles.append('utility')
-        reasons.append('utility module')
-
-    if record.language == 'python' and text:
-        py_info = extract_python_outline(text)
-        functions = py_info['functions']
-        classes = py_info['classes']
-        imports = py_info['imports']
-        main_calls = dedupe_preserve_order(py_info['main_guard_calls'] + py_info['main_function_calls'])[:8]
-        constants = py_info['constants']
-        dataclass_classes = py_info['dataclass_classes']
-
-        if py_info['has_main_guard'] and not (is_doc or is_benchmark or is_test):
-            roles.append('entrypoint')
-            reasons.append('__main__ guard')
-        if py_info['has_dispatcher_pattern'] and not (is_doc or is_benchmark or is_test):
-            roles.append('dispatcher')
-            reasons.append('command dispatch pattern')
-        if py_info['dataclass_classes'] and not (is_doc or is_benchmark):
-            roles.append('model')
-            reasons.append('dataclass model definitions')
-    elif record.language in {'javascript', 'typescript', 'jsx', 'tsx'} and text:
-        exports, classes = extract_js_ts_outline(text)
-
-    entrypoint_name = re.search(r'(^|/)(main|app|server|manage|cli)\.[A-Za-z0-9]+$', rel_path)
-    if entrypoint_name and not (is_doc or is_benchmark or is_test):
-        roles.append('entrypoint')
-        reasons.append('entrypoint-like filename')
-
-    if re.search(r'\b(FastAPI|Flask|APIRouter|Blueprint|Typer|ArgumentParser|click\.command|uvicorn\.run|app\s*=\s*FastAPI)\b', text) and not (is_doc or is_benchmark):
-        roles.append('entrypoint')
-        reasons.append('runtime/app signal')
-
-    if (functions or classes or exports) and not (is_doc or is_benchmark or is_test):
-        roles.append('runtime_module')
-        reasons.append('readable source module')
-
-    if constants and 'config' in roles:
-        reasons.append('module-level constants')
-
-    env_vars = extract_env_var_names(text)
-    if env_vars and 'config' not in roles:
-        roles.append('config')
-        reasons.append('environment variable usage')
-
-    roles = dedupe_preserve_order(roles)
-    reasons = dedupe_preserve_order(reasons)
-
-    source_tier = 2
-    if 'doc' in roles:
-        source_tier = 0
-    elif 'benchmark' in roles:
-        source_tier = 1
-    elif any(role in roles for role in ('config', 'test')):
-        source_tier = 3
-    elif any(role in roles for role in ('entrypoint', 'dispatcher', 'runtime_module', 'model', 'utility')):
-        source_tier = 4
-
-    priority = record.importance
-    priority += source_tier * 18
-    priority += len(reasons) * 8
-    priority += min(len(env_vars), 5) * 4
-    priority += min(len(functions) + len(classes) + len(exports), 6) * 2
-
-    if 'entrypoint' in roles:
-        priority += 60
-    if 'dispatcher' in roles:
-        priority += 32
-    if 'config' in roles:
-        priority += 18
-    if 'model' in roles:
-        priority += 12
-    if 'test' in roles:
-        priority += 6
-    if 'doc' in roles:
-        priority -= 90
-    if 'benchmark' in roles:
-        priority -= 50
-
-    return {
-        'record': record,
-        'priority': priority,
-        'source_tier': source_tier,
-        'roles': roles,
-        'reasons': reasons,
-        'functions': functions,
-        'classes': classes,
-        'imports': imports,
-        'exports': exports,
-        'env_vars': env_vars,
-        'main_calls': main_calls,
-        'constants': constants,
-        'dataclass_classes': dataclass_classes,
-    }
-
-
-def build_local_module_index(summaries: list[dict[str, Any]]) -> dict[str, list[str]]:
-    index: dict[str, list[str]] = {}
-    for item in summaries:
-        record = item['record']
-        if record.language != 'python':
-            continue
-        for alias in python_module_aliases(record.rel_path):
-            index.setdefault(alias, []).append(record.rel_path)
-    for alias, paths in list(index.items()):
-        index[alias] = dedupe_preserve_order(paths)
-    return index
-
-
-def resolve_local_import_paths(import_name: str, module_index: dict[str, list[str]]) -> list[str]:
-    if import_name in module_index:
-        return module_index[import_name]
-    matched: list[str] = []
-    prefix = import_name + '.'
-    for alias, paths in module_index.items():
-        if alias.startswith(prefix):
-            matched.extend(paths)
-    return dedupe_preserve_order(matched)
-
-
-def build_record_summaries(inspection: InspectionResult) -> list[dict[str, Any]]:
-    readable = [
-        record for record in inspection.records
-        if not (record.is_binary or record.is_large or record.is_unreadable) and record.redacted_text
-    ]
-    summaries = [summarize_record_for_context(record) for record in readable]
-    module_index = build_local_module_index(summaries)
-    inbound_counts: dict[str, int] = {}
-
-    for item in summaries:
-        target_paths: list[str] = []
-        for import_name in item['imports']:
-            target_paths.extend(resolve_local_import_paths(import_name, module_index))
-        target_paths = dedupe_preserve_order(target_paths)
-        for rel_path in target_paths:
-            if rel_path == item['record'].rel_path:
-                continue
-            inbound_counts[rel_path] = inbound_counts.get(rel_path, 0) + 1
-
-    for item in summaries:
-        inbound_refs = inbound_counts.get(item['record'].rel_path, 0)
-        item['inbound_refs'] = inbound_refs
-        item['priority'] += inbound_refs * 14
-        if inbound_refs:
-            item['reasons'] = dedupe_preserve_order(item['reasons'] + [f'referenced by {inbound_refs} local module(s)'])
-
-    summaries.sort(key=lambda item: (-item['priority'], item['record'].rel_path))
-    return summaries
-
-
-def build_repo_facts_section(config: RuntimeConfig, inspection: InspectionResult, summaries: list[dict[str, Any]] | None = None) -> str:
-    summaries = summaries or build_record_summaries(inspection)
-    readable_count = len(summaries)
-
-    entry_candidates = [
-        item for item in summaries
-        if 'entrypoint' in item['roles'] and item['source_tier'] >= 3
-    ][:8]
-    runtime_candidates = [
-        item for item in summaries
-        if any(role in item['roles'] for role in ('entrypoint', 'dispatcher', 'runtime_module', 'model', 'utility')) and item['source_tier'] >= 3
-    ][:14]
-    config_candidates = [item for item in summaries if 'config' in item['roles']][:8]
-    test_candidates = [item for item in summaries if 'test' in item['roles']][:8]
-    doc_candidates = [item for item in summaries if 'doc' in item['roles']][:4]
-
-    env_vars: list[str] = []
-    for item in summaries[:60]:
-        env_vars.extend(item['env_vars'])
-    env_vars = dedupe_preserve_order(env_vars)[:20]
-
-    parts = [
-        '# RepoFacts',
-        '',
-        f'- Project root: `{config.project_root}`',
-        f'- Readable files available to AI: {readable_count}',
-        f'- Skipped binary files: {inspection.stats.skipped_binary}',
-        f'- Skipped large files: {inspection.stats.skipped_large}',
-        f'- Skipped unreadable files: {inspection.stats.skipped_unreadable}',
-        '',
-        '## Confirmed Entry Points',
-        '',
-    ]
-
-    if entry_candidates:
-        for item in entry_candidates:
-            details: list[str] = []
-            if item['functions']:
-                details.append('functions: ' + ', '.join(item['functions'][:3]))
-            if item['main_calls']:
-                details.append('calls: ' + ', '.join(item['main_calls'][:4]))
-            details.append('signals: ' + ', '.join(item['reasons'][:3]))
-            parts.append(f"- `{item['record'].rel_path}` — {'; '.join(details)}")
-    else:
-        parts.append('- Not found in provided context.')
-
-    parts.extend(['', '## Runtime-Critical Files', ''])
-    if runtime_candidates:
-        for item in runtime_candidates:
-            detail_bits: list[str] = []
-            if item['roles']:
-                detail_bits.append('roles: ' + ', '.join(item['roles'][:4]))
-            if item['classes']:
-                detail_bits.append('classes: ' + ', '.join(item['classes'][:4]))
-            if item['functions']:
-                detail_bits.append('functions: ' + ', '.join(item['functions'][:4]))
-            if item['imports']:
-                detail_bits.append('imports: ' + ', '.join(item['imports'][:4]))
-            if item['inbound_refs']:
-                detail_bits.append(f"local refs: {item['inbound_refs']}")
-            parts.append(f"- `{item['record'].rel_path}` — {'; '.join(detail_bits) if detail_bits else 'runtime-related file'}")
-    else:
-        parts.append('- Not found in provided context.')
-
-    parts.extend(['', '## Configuration Surface', ''])
-    if config_candidates:
-        for item in config_candidates:
-            details: list[str] = []
-            if item['constants']:
-                details.append('constants: ' + ', '.join(item['constants'][:6]))
-            if item['env_vars']:
-                details.append('env vars: ' + ', '.join(item['env_vars'][:6]))
-            if item['imports']:
-                details.append('imports: ' + ', '.join(item['imports'][:4]))
-            parts.append(f"- `{item['record'].rel_path}` — {'; '.join(details) if details else 'config-related file'}")
-    else:
-        parts.append('- No dedicated config file was clearly identified.')
-
-    if env_vars:
-        parts.extend(['', '### Environment Variables Seen', ''])
-        for name in env_vars:
-            parts.append(f'- `{name}`')
-
-    parts.extend(['', '## Test Surface', ''])
-    if test_candidates:
-        for item in test_candidates:
-            details = []
-            if item['functions']:
-                details.append('functions: ' + ', '.join(item['functions'][:4]))
-            if item['imports']:
-                details.append('imports: ' + ', '.join(item['imports'][:4]))
-            parts.append(f"- `{item['record'].rel_path}`{' — ' + '; '.join(details) if details else ''}")
-    else:
-        parts.append('- Not found in provided context.')
-
-    if doc_candidates:
-        parts.extend(['', '## Documentation And Intent Signals', ''])
-        for item in doc_candidates:
-            parts.append(f"- `{item['record'].rel_path}` — weaker evidence than runtime code; use mainly for project intent or declared philosophy")
-
-    parts.extend([
-        '',
-        '## Context Rules',
-        '',
-        '- Runtime code, config, and tests outrank markdown docs and benchmark/meta files.',
-        '- Prefer exact file paths and symbols over narrative summaries.',
-        '- Treat docs as intent hints, not as proof of runtime behavior.',
-        '- If a command or runtime detail is not explicit in code/config/tests, keep it as Likely or Not found in provided context.',
-        '',
     ])
 
-    return "\n".join(parts).rstrip() + "\n"
+    used_bytes = len("\n".join(parts).encode("utf-8"))
+    final_records: list[FileRecord] = []
+    capped_stats = stats
 
-
-def context_priority(item: dict[str, Any]) -> tuple[int, int, str]:
-    return (-item['source_tier'], -item['priority'], item['record'].rel_path)
-
-
-def build_ai_context(config: RuntimeConfig, dump: DumpResult, inspection: InspectionResult) -> AIContextResult:
-    summaries = build_record_summaries(inspection)
-    repo_facts = build_repo_facts_section(config, inspection, summaries)
-    readable = [item['record'] for item in summaries]
-    full_text = normalize_ai_context_text(repo_facts.rstrip() + "\n\n" + dump.text.lstrip())
-
-    if len(full_text) <= config.ai_max_context_chars:
-        return AIContextResult(text=full_text, used_compact_mode=False, selected_files=len(readable))
-
-    if config.ai_require_full_context:
-        raise ValueError(
-            f"Full repository context requires {len(full_text)} characters, which exceeds ai_max_context_chars={config.ai_max_context_chars}. "
-            "Increase AI_MAX_CONTEXT_CHARS or reduce the repository scope."
-        )
-
-    summaries.sort(key=context_priority)
-    tree = build_tree(config, [config.project_root / record.rel_path for record in inspection.records])
-    parts = [
-        '# CompactRepoContext',
-        '',
-        f'- Generated: {now_iso()}',
-        f'- Project root: `{config.project_root}`',
-        f'- Compact mode reason: repo facts + full dump exceed {config.ai_max_context_chars} characters',
-        '',
-        repo_facts.rstrip(),
-        '',
-        '## Repository Tree',
-        '',
-        '```text',
-        tree,
-        '```',
-        '',
-        '## Selected Files',
-        '',
-    ]
-    used_chars = sum(len(part) + 1 for part in parts)
-    selected_files = 0
-
-    for item in summaries:
-        if selected_files >= config.ai_max_selected_files:
-            break
-        record = item['record']
-        summary_bits: list[str] = []
-        if item['roles']:
-            summary_bits.append('roles: ' + ', '.join(item['roles'][:4]))
-        if item['functions']:
-            summary_bits.append('functions: ' + ', '.join(item['functions'][:4]))
-        if item['classes']:
-            summary_bits.append('classes: ' + ', '.join(item['classes'][:4]))
-        if item['imports']:
-            summary_bits.append('imports: ' + ', '.join(item['imports'][:4]))
-        if item['main_calls']:
-            summary_bits.append('calls: ' + ', '.join(item['main_calls'][:4]))
-        if item['env_vars']:
-            summary_bits.append('env: ' + ', '.join(item['env_vars'][:5]))
-        if item['inbound_refs']:
-            summary_bits.append(f"local refs: {item['inbound_refs']}")
-        summary_line = ('- ' + '; '.join(summary_bits) + '\n\n') if summary_bits else ''
-        section = f"### {record.rel_path}\n\n{summary_line}```{record.language}\n{record.redacted_text}\n```\n\n"
-        if used_chars + len(section) > config.ai_max_context_chars:
+    for record in records:
+        if not record.include:
+            final_records.append(record)
             continue
+
+        section = render_file_section(record)
+        section_bytes = len(section.encode("utf-8"))
+        if used_bytes + section_bytes > config.max_total_dump_bytes:
+            capped = replace(
+                record,
+                include=False,
+                redacted_text=None,
+                skipped_reason=f"total dump cap reached: {config.max_total_dump_bytes} bytes",
+            )
+            final_records.append(capped)
+            capped_stats = bump(capped_stats, "skipped_total_cap")
+            capped_stats = replace(capped_stats, included=max(0, capped_stats.included - 1))
+            continue
+
         parts.append(section.rstrip())
-        parts.append('')
-        used_chars += len(section)
-        selected_files += 1
+        parts.append("")
+        used_bytes += section_bytes
+        final_records.append(record)
 
-    compact_text = "\n".join(parts).rstrip() + "\n"
-    return AIContextResult(text=normalize_ai_context_text(compact_text), used_compact_mode=True, selected_files=selected_files)
+    parts.append(render_skipped_section(final_records).rstrip())
+    parts.append("")
+
+    if config.explain:
+        parts.append(render_explain_section(final_records).rstrip())
+        parts.append("")
+
+    # Re-render header stats if total cap changed anything.
+    if capped_stats != stats:
+        parts = [
+            "# CodebaseDump",
+            "",
+            f"- Generated: {now_iso()}",
+            f"- Generator: SumAi CodebaseDump v{GENERATOR_VERSION}",
+            f"- Project: `{project_name}`",
+            *render_stats(capped_stats, discovery.backend, final_records),
+            "",
+            "## Repository Tree",
+            "",
+            "```text",
+            build_tree(project_name, [record.rel_path for record in final_records if record.include]),
+            "```",
+            "",
+            "## Files",
+            "",
+            *parts[parts.index("## Files") + 2:],
+        ]
+
+    return "\n".join(parts).rstrip() + "\n", capped_stats
 
 
-def build_artifact_specs() -> tuple[ArtifactSpec, ...]:
-    return (
-        ArtifactSpec(
-            slug='01_repository_research',
-            title='Artifact 01 — Repository Research Pack',
-            output_name='01_repository_research.md',
-            focus=ARTIFACT_FOCUS,
-        ),
+# =============================================================================
+# PIPELINE / CLI
+# =============================================================================
+
+
+def build_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
+    root = pathlib.Path(args.root).resolve() if args.root else PROJECT_ROOT.resolve()
+    if not root.is_dir():
+        raise SystemExit(f"[codebase-dump] Error: root path does not exist or is not a directory: {root}")
+
+    config = RuntimeConfig(
+        project_root=root,
+        output_name=args.output or f"{OUTPUT_DUMP_PREFIX}_{root.name or 'project'}.md",
+        include_lockfiles=args.include_lockfiles,
+        include_generated=args.include_generated,
+        include_all_configs=args.include_all_configs,
+        explain=args.explain,
     )
+    return replace(config, simple_ignore_patterns=load_simple_ignore_patterns(root))
 
 
-def build_research_prompt(config: RuntimeConfig, spec: ArtifactSpec, context_text: str) -> str:
-    sections = "\n".join(RESEARCH_PROMPT_SECTIONS) + "\n\n"
-    rules = "Rules:\n" + "\n".join(f"- {rule}" for rule in RESEARCH_PROMPT_RULES) + "\n\n"
-    return (
-        f"Produce a dense Markdown artifact named `{spec.output_name}` with this exact structure:\n\n"
-        f"# {spec.title}\n"
-        f"{sections}"
-        f"Goal:\n{RESEARCH_PROMPT_GOAL}\n\n"
-        f"{rules}"
-        "Repository context:\n\n"
-        f"{context_text}"
-    )
-
-
-def build_artifact_bundle(artifacts: tuple[ArtifactResult, ...]) -> str:
-    parts = ['# Research Artifact Bundle', '', 'This bundle is ordered for the aggregator: instruction-ready research first, repository context later in the final prompt.', '']
-    for artifact in artifacts:
-        parts.extend([
-            f"## {artifact.title}",
-            '',
-            artifact.text.strip(),
-            '',
-        ])
-    return "\n".join(parts).rstrip() + "\n"
-
-
-def build_readme_prompt(config: RuntimeConfig, artifact_bundle_text: str, context_text: str) -> str:
-    sections = "\n".join(README_PROMPT_SECTIONS) + "\n\n"
-    rules = "Rules:\n" + "\n".join(f"- {rule}" for rule in README_PROMPT_RULES) + "\n\n"
-    return (
-        f"Produce a rich Markdown file named `{config.readme_name}` with this exact structure:\n\n"
-        f"{sections}"
-        f"{rules}"
-        "Research artifact:\n\n"
-        f"{artifact_bundle_text}\n\n"
-        "Repository context:\n\n"
-        f"{context_text}"
-    )
-
-
-def ai_endpoint_url(config: RuntimeConfig) -> str:
-    base = normalize_base_url(config.ai_base_url)
-    if config.ai_protocol == "chat_completions":
-        return base if base.endswith("/chat/completions") else base + "/chat/completions"
-    if config.ai_protocol == "responses":
-        return base if base.endswith("/responses") else base + "/responses"
-    raise ValueError(f"Unsupported ai_protocol: {config.ai_protocol}")
-
-
-def build_chat_messages(config: RuntimeConfig, prompt: str) -> list[dict[str, str]]:
-    return [
-        {"role": "system", "content": config.ai_system_prompt},
-        {"role": "user", "content": prompt},
-    ]
-
-
-def build_ai_request_payload(config: RuntimeConfig, prompt: str) -> dict[str, Any]:
-    if config.ai_protocol == "chat_completions":
-        payload: dict[str, Any] = {
-            "model": config.ai_model,
-            "messages": build_chat_messages(config, prompt),
-            "max_tokens": config.ai_max_output_tokens,
-        }
-        if config.ai_temperature is not None:
-            payload["temperature"] = config.ai_temperature
-        return payload
-    if config.ai_protocol == "responses":
-        payload = {
-            "model": config.ai_model,
-            "input": prompt,
-            "instructions": config.ai_system_prompt,
-            "max_output_tokens": config.ai_max_output_tokens,
-        }
-        if config.ai_temperature is not None:
-            payload["temperature"] = config.ai_temperature
-        return payload
-    raise ValueError(f"Unsupported ai_protocol: {config.ai_protocol}")
-
-
-def build_ai_request(config: RuntimeConfig, prompt: str) -> AIRequest:
-    payload = build_ai_request_payload(config, prompt)
-    endpoint = ai_endpoint_url(config)
-    return AIRequest(prompt=prompt, payload=payload, endpoint_url=endpoint)
-
-
-# ============================================================================
-# AI CLIENT
-# ============================================================================
-
-
-def extract_text_from_chat_completion(data: dict[str, Any]) -> str:
-    choices = data.get("choices") or []
-    if not choices:
-        return ""
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        chunks: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") in {"text", "output_text"} and item.get("text"):
-                chunks.append(str(item["text"]))
-        return "\n".join(chunks).strip()
-    return ""
-
-
-def extract_text_from_responses_api(data: dict[str, Any]) -> str:
-    output_text = data.get("output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-    chunks: list[str] = []
-    for item in data.get("output") or []:
-        if item.get("type") != "message":
-            continue
-        for content in item.get("content") or []:
-            if content.get("type") == "output_text" and content.get("text"):
-                chunks.append(str(content["text"]))
-    return "\n".join(chunks).strip()
-
-
-def extract_ai_response_text(config: RuntimeConfig, data: dict[str, Any]) -> str:
-    if config.ai_protocol == "chat_completions":
-        return extract_text_from_chat_completion(data)
-    if config.ai_protocol == "responses":
-        return extract_text_from_responses_api(data)
-    return ""
-
-
-def strip_outer_markdown_fence(text: str) -> str:
-    stripped = text.strip()
-    if not stripped.startswith("```"):
-        return stripped
-    lines = stripped.splitlines()
-    if len(lines) < 2:
-        return stripped
-    if not lines[0].startswith("```"):
-        return stripped
-    if lines[-1].strip() != "```":
-        return stripped
-    return "\n".join(lines[1:-1]).strip()
-
-
-def default_request_headers(config: RuntimeConfig) -> dict[str, str]:
-    headers = {
-        "Authorization": f"Bearer {config.ai_api_key}",
-        "Content-Type": "application/json",
-    }
-    if config.ai_provider_name.lower().startswith("zai"):
-        headers["Accept-Language"] = "en-US,en"
-    return headers
-
-
-def call_ai(config: RuntimeConfig, request: AIRequest) -> AIResponse:
-    payload_bytes = json.dumps(request.payload).encode("utf-8")
-    http_request = urllib.request.Request(
-        request.endpoint_url,
-        data=payload_bytes,
-        headers=default_request_headers(config),
-        method="POST",
-    )
-    with urllib.request.urlopen(http_request, timeout=config.ai_request_timeout_seconds) as response:
-        raw_text = response.read().decode("utf-8", errors="replace")
-    parsed = json.loads(raw_text)
-    text = extract_ai_response_text(config, parsed)
-    if not text:
-        raise RuntimeError("AI response did not contain readable text output.")
-    cleaned = strip_outer_markdown_fence(text)
-    return AIResponse(text=cleaned.strip(), raw=parsed)
-
-
-
-def call_ai_with_gap(
-    config: RuntimeConfig,
-    request: AIRequest,
-    effective_ai_caller: Callable[[RuntimeConfig, AIRequest], AIResponse],
-    last_call_finished_at: list[float | None],
-    label: str,
-    logger: Callable[[str], None] | None = None,
-) -> AIResponse:
-    if last_call_finished_at[0] is not None:
-        elapsed = time.perf_counter() - last_call_finished_at[0]
-        wait_seconds = config.ai_request_gap_seconds - elapsed
-        if wait_seconds > 0:
-            if logger:
-                logger(f"[sumai] Waiting {wait_seconds:.2f}s before {label}")
-            time.sleep(wait_seconds)
-
-    try:
-        response = effective_ai_caller(config, request)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 429:
-            retry_seconds = max(config.ai_request_gap_seconds + 4.0, 5.0)
-            retry_after = None
-            if getattr(exc, 'headers', None):
-                retry_after = exc.headers.get('Retry-After')
-            if retry_after:
-                try:
-                    retry_seconds = max(retry_seconds, float(retry_after))
-                except ValueError:
-                    pass
-            if logger:
-                logger(f"[sumai] HTTP 429 during {label}; retrying once after {retry_seconds:.1f}s")
-            time.sleep(retry_seconds)
-            response = effective_ai_caller(config, request)
-        else:
-            last_call_finished_at[0] = time.perf_counter()
-            raise
-
-    last_call_finished_at[0] = time.perf_counter()
-    return response
-
-
-def build_placeholder_readme(reason: str) -> str:
-    return (
-        "> ⚠️ **This document was generated by an AI summarizer "
-        "([sumai](https://github.com/bakunin-dev/sumai)).** "
-        "It reflects the repository state at the time of generation and may contain errors or omissions. "
-        "Always verify against actual source code before making decisions.\n\n"
-        "# ReadmeDev\n\n"
-        "ReadmeDev generation was skipped.\n\n"
-        f"Reason: {reason}\n\n"
-        f"Open `{SCRIPT_NAME}` and edit the AI CONFIG block near the top of the file.\n"
-    )
-
-
-# ============================================================================
-# PIPELINE
-# ============================================================================
-
-
-def record_stage(
-    timings: dict[str, StageTiming],
-    name: str,
-    started: float,
-    status: str,
-    meta: dict[str, Any] | None = None,
-) -> None:
-    timings[name] = StageTiming(
-        duration_ms=round((time.perf_counter() - started) * 1000, 3),
-        status=status,
-        meta=meta or {},
-    )
-
-
-def write_artifact_result(config: RuntimeConfig, artifact: ArtifactResult) -> pathlib.Path:
-    path = config.artifact_dir / artifact.output_name
-    atomic_write_text(path, artifact.text.rstrip() + "\n")
-    return path
-
-
-def write_artifact_manifest(config: RuntimeConfig, artifacts: tuple[ArtifactResult, ...]) -> None:
-    manifest = {
-        "generated_at": now_iso(),
-        "artifact_dir": str(config.artifact_dir),
-        "artifacts": [
-            {
-                "slug": artifact.slug,
-                "title": artifact.title,
-                "output_name": artifact.output_name,
-            }
-            for artifact in artifacts
-        ],
-    }
-    atomic_write_json(config.artifact_dir / "manifest.json", manifest)
-
-
-def run_pipeline(
-    config: RuntimeConfig,
-    ai_caller: Callable[[RuntimeConfig, AIRequest], AIResponse] | None = None,
-    logger: Callable[[str], None] | None = log,
-) -> PipelineResult:
-    timings: dict[str, StageTiming] = {}
-    discovery: DiscoveryResult | None = None
-    inspection: InspectionResult | None = None
-    dump: DumpResult | None = None
-    ai_context: AIContextResult | None = None
-    ai_request: AIRequest | None = None
-    ai_response: AIResponse | None = None
-    artifacts: tuple[ArtifactResult, ...] = tuple()
-
-    os.chdir(config.project_root)
-    config.artifact_dir.mkdir(parents=True, exist_ok=True)
-    effective_ai_caller = ai_caller or call_ai
-
+def run_pipeline(config: RuntimeConfig, logger: Callable[[str], None] | None = log) -> DumpResult:
     started = time.perf_counter()
     discovery = discover_project_files(config, logger=logger)
-    record_stage(timings, "discover_project_files", started, "ok", {
-        "files": len(discovery.files),
-        "backend": discovery.backend,
-        "truncated": discovery.truncated,
-    })
+    records, stats = inspect_project_files(config, discovery)
+    text, stats = render_dump(config, discovery, records, stats)
+    atomic_write_text(config.output_path, text)
+    duration_ms = round((time.perf_counter() - started) * 1000, 3)
+    return DumpResult(text=text, records=records, stats=stats, duration_ms=duration_ms)
 
-    if not discovery.files:
-        started = time.perf_counter()
-        dump = DumpResult(text="# CodebaseDump\n\nNo files found.\n", stats=FileStats())
-        atomic_write_text(config.dump_path, dump.text)
-        record_stage(timings, "write_dump", started, "ok", {"path": str(config.dump_path)})
 
-        started = time.perf_counter()
-        placeholder = build_placeholder_readme("No files found in project.")
-        atomic_write_text(config.readme_path, placeholder)
-        record_stage(timings, "write_readme", started, "ok", {"path": str(config.readme_path), "reason": "no_files"})
-        return PipelineResult(return_code=0, timings=timings, discovery=discovery, dump=dump)
-
-    started = time.perf_counter()
-    inspection = inspect_project_files(config, discovery)
-    record_stage(timings, "inspect_project_files", started, "ok", {
-        "records": len(inspection.records),
-        "included": inspection.stats.included,
-    })
-
-    if config.verbose_explain:
-        if logger:
-            logger("[sumai] --- File inclusion explainer ---")
-        for record in inspection.records:
-            reasons: list[str] = []
-            if record.is_binary:
-                reasons.append("binary file")
-            elif record.is_large:
-                reasons.append(f"file too large ({record.size} > {config.max_file_bytes} bytes)")
-            elif record.is_unreadable:
-                reasons.append("unreadable")
-            else:
-                reasons.append("included")
-            if not (record.is_binary or record.is_large or record.is_unreadable):
-                summaries = build_record_summaries(inspection)
-                for s in summaries:
-                    if s['record'].rel_path == record.rel_path:
-                        if s['reasons']:
-                            reasons.append("important: " + ", ".join(s['reasons'][:3]))
-                        reasons.append(f"score={s['priority']}")
-                        break
-            if logger:
-                logger(f"  {'INCL' if 'included' in reasons else 'EXCL'}: {record.rel_path} — {', '.join(reasons)}")
-        if logger:
-            logger("[sumai] --- End of explainer ---")
-
-    started = time.perf_counter()
-    dump = render_dump(config, discovery, inspection)
-    record_stage(timings, "render_dump", started, "ok", {"chars": len(dump.text)})
-
-    if config.write_dump:
-        started = time.perf_counter()
-        atomic_write_text(config.dump_path, dump.text)
-        record_stage(timings, "write_dump", started, "ok", {"path": str(config.dump_path)})
-    else:
-        record_stage(timings, "write_dump", time.perf_counter(), "skipped", {"reason": "write_dump=False"})
-
-    if not config.ai_enabled:
-        if config.write_readme:
-            started = time.perf_counter()
-            placeholder = build_placeholder_readme("AI is disabled.")
-            atomic_write_text(config.readme_path, placeholder)
-            record_stage(timings, "write_readme", started, "ok", {"path": str(config.readme_path), "reason": "ai_disabled"})
-        else:
-            record_stage(timings, "write_readme", time.perf_counter(), "skipped", {"reason": "write_readme=False"})
-        record_stage(timings, "build_ai_context", time.perf_counter(), "skipped", {"reason": "ai_disabled"})
-        return PipelineResult(return_code=0, timings=timings, discovery=discovery, inspection=inspection, dump=dump)
-
-    if not config.ai_api_key or config.ai_api_key == "PASTE_YOUR_API_KEY_HERE":
-        if config.write_readme:
-            started = time.perf_counter()
-            placeholder = build_placeholder_readme("AI_API_KEY is not configured.")
-            atomic_write_text(config.readme_path, placeholder)
-            record_stage(timings, "write_readme", started, "ok", {"path": str(config.readme_path), "reason": "missing_api_key"})
-        else:
-            record_stage(timings, "write_readme", time.perf_counter(), "skipped", {"reason": "write_readme=False"})
-        record_stage(timings, "build_ai_context", time.perf_counter(), "skipped", {"reason": "missing_api_key"})
-        return PipelineResult(return_code=0, timings=timings, discovery=discovery, inspection=inspection, dump=dump)
-
-    started = time.perf_counter()
-    try:
-        ai_context = build_ai_context(config, dump, inspection)
-    except Exception as exc:
-        placeholder = build_placeholder_readme(str(exc))
-        started_write = time.perf_counter()
-        atomic_write_text(config.readme_path, placeholder)
-        record_stage(timings, "build_ai_context", started, "error", {"error": str(exc)})
-        record_stage(timings, "write_readme", started_write, "ok", {"path": str(config.readme_path), "reason": "context_error"})
-        return PipelineResult(return_code=1, timings=timings, discovery=discovery, inspection=inspection, dump=dump)
-
-    record_stage(timings, "build_ai_context", started, "ok", {
-        "chars": len(ai_context.text),
-        "used_compact_mode": ai_context.used_compact_mode,
-        "selected_files": ai_context.selected_files,
-    })
-
-    if config.verbose_explain and logger:
-        if ai_context.used_compact_mode:
-            logger(f"[sumai] Compact mode: selected {ai_context.selected_files} files from {len(inspection.records)} total (limit: {config.ai_max_context_chars} chars)")
-        else:
-            logger(f"[sumai] Full context mode: {ai_context.selected_files} files ({len(ai_context.text)} chars)")
-
-    last_call_finished_at: list[float | None] = [None]
-    artifact_results: list[ArtifactResult] = []
-
-    for spec in build_artifact_specs():
-        prompt = build_research_prompt(config, spec, ai_context.text)
-        request = build_ai_request(config, prompt)
-        stage_name = f"agent_{spec.slug}"
-        started = time.perf_counter()
-        try:
-            response = call_ai_with_gap(
-                config,
-                request,
-                effective_ai_caller,
-                last_call_finished_at,
-                label=spec.slug,
-                logger=logger,
-            )
-        except urllib.error.HTTPError as exc:
-            try:
-                error_body = exc.read().decode("utf-8", errors="replace")
-            except Exception:
-                error_body = ""
-            placeholder = build_placeholder_readme(f"HTTP {exc.code} during {spec.slug}: {error_body[:3000] or exc.reason}")
-            started_write = time.perf_counter()
-            atomic_write_text(config.readme_path, placeholder)
-            record_stage(timings, stage_name, started, "error", {"kind": "http", "code": exc.code})
-            record_stage(timings, "write_readme", started_write, "ok", {"path": str(config.readme_path), "reason": "http_error"})
-            return PipelineResult(
-                return_code=1,
-                timings=timings,
-                discovery=discovery,
-                inspection=inspection,
-                dump=dump,
-                ai_context=ai_context,
-                ai_request=request,
-                artifacts=tuple(artifact_results),
-            )
-        except urllib.error.URLError as exc:
-            placeholder = build_placeholder_readme(f"Network error during {spec.slug}: {exc.reason}")
-            started_write = time.perf_counter()
-            atomic_write_text(config.readme_path, placeholder)
-            record_stage(timings, stage_name, started, "error", {"kind": "network", "reason": str(exc.reason)})
-            record_stage(timings, "write_readme", started_write, "ok", {"path": str(config.readme_path), "reason": "network_error"})
-            return PipelineResult(
-                return_code=1,
-                timings=timings,
-                discovery=discovery,
-                inspection=inspection,
-                dump=dump,
-                ai_context=ai_context,
-                ai_request=request,
-                artifacts=tuple(artifact_results),
-            )
-        except Exception as exc:
-            placeholder = build_placeholder_readme(f"Unexpected error during {spec.slug}: {exc}")
-            started_write = time.perf_counter()
-            atomic_write_text(config.readme_path, placeholder)
-            record_stage(timings, stage_name, started, "error", {"kind": "unexpected", "error": str(exc)})
-            record_stage(timings, "write_readme", started_write, "ok", {"path": str(config.readme_path), "reason": "unexpected_error"})
-            return PipelineResult(
-                return_code=1,
-                timings=timings,
-                discovery=discovery,
-                inspection=inspection,
-                dump=dump,
-                ai_context=ai_context,
-                ai_request=request,
-                artifacts=tuple(artifact_results),
-            )
-
-        artifact = ArtifactResult(
-            slug=spec.slug,
-            title=spec.title,
-            output_name=spec.output_name,
-            prompt=prompt,
-            text=response.text,
-        )
-        artifact_results.append(artifact)
-        write_artifact_result(config, artifact)
-        record_stage(timings, stage_name, started, "ok", {
-            "prompt_chars": len(prompt),
-            "response_chars": len(response.text),
-            "path": str(config.artifact_dir / spec.output_name),
-        })
-
-    artifacts = tuple(artifact_results)
-    write_artifact_manifest(config, artifacts)
-
-    artifact_bundle_text = build_artifact_bundle(artifacts)
-
-    started = time.perf_counter()
-    final_prompt = build_readme_prompt(config, artifact_bundle_text, ai_context.text)
-    ai_request = build_ai_request(config, final_prompt)
-    record_stage(timings, "build_ai_request", started, "ok", {
-        "prompt_chars": len(ai_request.prompt),
-        "endpoint_url": ai_request.endpoint_url,
-        "artifacts": len(artifacts),
-    })
-
-    started = time.perf_counter()
-    aggregator_stage_name = "agent_readme_aggregator"
-    try:
-        ai_response = call_ai_with_gap(
-            config,
-            ai_request,
-            effective_ai_caller,
-            last_call_finished_at,
-            label="aggregator",
-            logger=logger,
-        )
-    except urllib.error.HTTPError as exc:
-        try:
-            error_body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            error_body = ""
-        placeholder = build_placeholder_readme(f"HTTP {exc.code}: {error_body[:3000] or exc.reason}")
-        started_write = time.perf_counter()
-        atomic_write_text(config.readme_path, placeholder)
-        record_stage(timings, aggregator_stage_name, started, "error", {"kind": "http", "code": exc.code})
-        record_stage(timings, "write_readme", started_write, "ok", {"path": str(config.readme_path), "reason": "http_error"})
-        return PipelineResult(
-            return_code=1,
-            timings=timings,
-            discovery=discovery,
-            inspection=inspection,
-            dump=dump,
-            ai_context=ai_context,
-            ai_request=ai_request,
-            artifacts=artifacts,
-        )
-    except urllib.error.URLError as exc:
-        placeholder = build_placeholder_readme(f"Network error: {exc.reason}")
-        started_write = time.perf_counter()
-        atomic_write_text(config.readme_path, placeholder)
-        record_stage(timings, aggregator_stage_name, started, "error", {"kind": "network", "reason": str(exc.reason)})
-        record_stage(timings, "write_readme", started_write, "ok", {"path": str(config.readme_path), "reason": "network_error"})
-        return PipelineResult(
-            return_code=1,
-            timings=timings,
-            discovery=discovery,
-            inspection=inspection,
-            dump=dump,
-            ai_context=ai_context,
-            ai_request=ai_request,
-            artifacts=artifacts,
-        )
-    except Exception as exc:
-        placeholder = build_placeholder_readme(f"Unexpected error: {exc}")
-        started_write = time.perf_counter()
-        atomic_write_text(config.readme_path, placeholder)
-        record_stage(timings, aggregator_stage_name, started, "error", {"kind": "unexpected", "error": str(exc)})
-        record_stage(timings, "write_readme", started_write, "ok", {"path": str(config.readme_path), "reason": "unexpected_error"})
-        return PipelineResult(
-            return_code=1,
-            timings=timings,
-            discovery=discovery,
-            inspection=inspection,
-            dump=dump,
-            ai_context=ai_context,
-            ai_request=ai_request,
-            artifacts=artifacts,
-        )
-
-    record_stage(timings, aggregator_stage_name, started, "ok", {})
-
-    started = time.perf_counter()
-    ai_warning = (
-        "> ⚠️ **This document was generated by an AI summarizer "
-        "([sumai](https://github.com/bakunin-dev/sumai)).** "
-        "It reflects the repository state at the time of generation and may contain errors or omissions. "
-        "Always verify against actual source code before making decisions.\n\n"
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="codebase_dump.py",
+        description="Generate a clean CodebaseDump.md from source/docs/small important configs.",
     )
-    atomic_write_text(config.readme_path, ai_warning + ai_response.text.rstrip() + "\n")
-    record_stage(timings, "write_readme", started, "ok", {"path": str(config.readme_path)})
-
-    return PipelineResult(
-        return_code=0,
-        timings=timings,
-        discovery=discovery,
-        inspection=inspection,
-        dump=dump,
-        ai_context=ai_context,
-        ai_request=ai_request,
-        ai_response=ai_response,
-        artifacts=artifacts,
-    )
+    parser.add_argument("--root", "-r", default=None, help="Project root to scan. Default: directory of this script.")
+    parser.add_argument("--output", "-o", default=None, help="Output markdown filename. Default: snapcode_<project-folder>.md")
+    parser.add_argument("--include-lockfiles", action="store_true", help="Include package-manager lockfiles when they pass size/text checks.")
+    parser.add_argument("--include-generated", action="store_true", help="Include generated files when they pass size/text checks.")
+    parser.add_argument("--include-all-configs", action="store_true", help="Include generic json/yaml/toml/ini/cfg files, not only important configs.")
+    parser.add_argument("--explain", "-e", action="store_true", help="Add a File Decisions section to the dump.")
+    return parser.parse_args(argv)
 
 
-COMMANDS = ("all", "dump", "readme")
-
-
-def parse_args() -> tuple[str, pathlib.Path, bool]:
-    """Parse CLI arguments. Returns (command, project_root, verbose_explain)."""
-    import sys as _sys
-    args = _sys.argv[1:]
-    command = "all"
-    project_root = PROJECT_ROOT
-    verbose_explain = VERBOSE_EXPLAIN
-
-    # Extract command if first non-flag arg
-    if args and not args[0].startswith("-"):
-        command = args[0].lower()
-        args = args[1:]
-        if command not in COMMANDS:
-            print(
-                f"[sumai] Unknown command: {command!r}. "
-                f"Valid commands: {', '.join(COMMANDS)}. Use --help for usage.",
-                flush=True,
-            )
-            raise SystemExit(1)
-
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg in ("--root", "-r"):
-            if i + 1 >= len(args):
-                print("[sumai] Error: --root requires a path argument", flush=True)
-                raise SystemExit(1)
-            project_root = pathlib.Path(args[i + 1]).resolve()
-            if not project_root.is_dir():
-                print(
-                    f"[sumai] Error: --root path does not exist or is not a directory: {project_root}",
-                    flush=True,
-                )
-                raise SystemExit(1)
-            i += 2
-        elif arg in ("--explain", "-e"):
-            verbose_explain = True
-            i += 1
-        elif arg in ("--help", "-h"):
-            print(
-                "Usage: python sumai.py [command] [--root PATH] [--explain]\n"
-                "\n"
-                "Commands:\n"
-                "  all     Write CodebaseDump.md and ReadmeDev.md (default)\n"
-                "  dump    Write CodebaseDump.md only — no AI call\n"
-                "  readme  Write ReadmeDev.md only — AI call, dump not saved\n"
-                "\n"
-                "Options:\n"
-                "  --root PATH, -r PATH   Project root to scan (default: directory of sumai.py)\n"
-                "  --explain, -e          Explain why files are included/excluded/important\n"
-                "  --help, -h             Show this message\n",
-                flush=True,
-            )
-            raise SystemExit(0)
-        else:
-            print(f"[sumai] Unknown argument: {arg!r}. Use --help for usage.", flush=True)
-            raise SystemExit(1)
-    return command, project_root, verbose_explain
-
-
-def main() -> int:
-    command, project_root, verbose_explain = parse_args()
-    config = build_runtime_config(project_root=project_root)
-
-    if command == "dump":
-        config = replace(config, ai_enabled=False, write_dump=True, write_readme=False, verbose_explain=verbose_explain)
-    elif command == "readme":
-        config = replace(config, ai_enabled=True, write_dump=False, write_readme=True, verbose_explain=verbose_explain)
-    else:  # "all"
-        config = replace(config, ai_enabled=True, write_dump=True, write_readme=True, verbose_explain=verbose_explain)
-
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    config = build_runtime_config(args)
     result = run_pipeline(config=config, logger=log)
-    if config.artifact_dir.exists():
-        shutil.rmtree(config.artifact_dir)
 
-    if result.return_code == 0:
-        if command == "dump":
-            log(f"[sumai] Done. Wrote {config.dump_name}.")
-        elif command == "readme":
-            log(f"[sumai] Done. Wrote {config.readme_name}.")
-        else:
-            log(f"[sumai] Done. Wrote {config.dump_name} and {config.readme_name}.")
-    else:
-        log("[sumai] Completed with errors.")
-    return result.return_code
+    log(
+        f"[codebase-dump] Done. Wrote {config.output_path.name}. "
+        f"Included {result.stats.included} file(s), skipped "
+        f"{len([record for record in result.records if not record.include])} file(s), "
+        f"{result.duration_ms} ms."
+    )
+    return 0
 
 
 if __name__ == "__main__":
