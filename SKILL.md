@@ -1,193 +1,55 @@
-# SKILL: sumai — codebase summarizer
-
-## What this tool does
-
-`sumai.py` is a zero-dependency Python script that scans the current project and produces two files:
-
-- `CodebaseDump.md` — full codebase snapshot (all text files, redacted, structured as markdown)
-- `ReadmeDev.md` — AI-generated developer reference document (architecture, entrypoints, runtime flow, extension guide, gaps)
-
-The script runs a two-pass LLM pipeline: a research agent collects grounded technical facts, then an aggregator writes the final `ReadmeDev.md`. Intermediate artifacts are cleaned up automatically.
-
 ---
 
-## When to invoke sumai
+name: sumai
+description: Use when the user wants to create a Markdown snapshot of a codebase for AI review, onboarding, refactoring, or analysis.
+-------------------------------------------------------------------------------------------------------------------------------------
 
-| Situation | Command |
-|---|---|
-| User asks to "generate docs" / "update ReadmeDev" | `readme` or `all` |
-| User asks to "dump the codebase" / "create a codebase snapshot" | `dump` |
-| User asks to "run sumai" without specifics | `all` |
-| No API key available but codebase snapshot needed | `dump` |
-| ReadmeDev.md is missing or stale, dump already fresh | `readme` |
-| Fresh start on an unfamiliar project | `all` |
+# SumAI
 
-Do **not** invoke sumai for routine coding tasks, file edits, or questions that don't require a full project overview.
+SumAI is a single-file, zero-dependency Python script that collects useful repository files into one Markdown document.
 
----
+It works locally:
 
-## How to invoke
+* no AI API calls
+* no HTTP requests
+* no external dependencies
+
+## Usage
+
+Run from the project root:
 
 ```bash
-export MISTRAL_API_KEY=your_key_here
-
-# Write CodebaseDump.md + ReadmeDev.md
-python sumai.py all --root /path/to/project
-
-# Write CodebaseDump.md only (no AI, no API key needed)
-python sumai.py dump --root /path/to/project
-
-# Write ReadmeDev.md only (AI call, dump not saved)
-python sumai.py readme --root /path/to/project
-
-# --root optional if sumai.py is in the project root
-python sumai.py all
+python sumai.py
 ```
 
-**Command summary:**
+Scan another project:
 
-| Command | AI call | Writes CodebaseDump.md | Writes ReadmeDev.md |
-|---|---|---|---|
-| `all` | ✅ | ✅ | ✅ |
-| `dump` | ❌ | ✅ | ❌ |
-| `readme` | ✅ | ❌ | ✅ |
-
----
-
-## AI Model Router
-
-sumai uses a typed preset system at the top of `sumai.py`.
-
-### Quick switch
-
-```python
-AI_MODEL_PRESET = "mistral_small"  # one line to change model
+```bash
+python sumai.py --root /path/to/project
 ```
 
-### Built-in presets
+The default output is:
 
-| Preset | Provider | Protocol | Model |
-|--------|----------|----------|-------|
-| `mistral_small` | Mistral | chat_completions | mistral-small-2603 |
-| `glm_flash` | Z.ai | chat_completions | glm-4.7-flash |
-| `openai_gpt5` | OpenAI | responses | gpt-5 |
-
-### Add custom model
-
-One entry in `MODEL_REGISTRY`:
-
-```python
-MODEL_REGISTRY["my_model"] = ModelSpec(
-    provider_name="my_model",
-    protocol="chat_completions",
-    base_url="https://api.example.com/v1",
-    model="my-model-name",
-    env_keys=("MY_API_KEY", "AI_API_KEY"),
-)
+```text
+snapcode_<project-folder>.md
 ```
 
-Then: `AI_MODEL_PRESET = "my_model"`
+Optional flags:
 
-### Override mode
-
-```python
-AI_MODEL_PRESET = "mistral_small"
-AI_MODEL_OVERRIDE = "mistral-small-latest"
-AI_BASE_URL_OVERRIDE = "https://my-proxy.com/v1"
-AI_API_KEY_OVERRIDE = "sk-..."
+```bash
+--output <filename>
+--explain
+--include-lockfiles
+--include-generated
+--include-all-configs
 ```
 
-### Legacy config (still works)
+Use `--explain` when the user wants to see why files were included or skipped.
 
-For backward compatibility, you can still set these directly:
-- `AI_PROTOCOL`, `AI_BASE_URL`, `AI_MODEL`, `AI_API_KEY`
+After running, report:
 
-| Variable | What it controls |
-|---|---|
-| `AI_ENABLED` | Set `False` to skip LLM call |
-| `AI_MAX_CONTEXT_CHARS` | Max chars sent to LLM (default: 600_000) |
-| `AI_MAX_OUTPUT_TOKENS` | Max tokens in response (default: 8000) |
+* output filename
+* number of included files
+* number of skipped files
 
----
-
-## Output files
-
-| File | Description | When written |
-|---|---|---|
-| `CodebaseDump.md` | Full codebase as structured markdown. Every text file, binary/secret indicators, file tree. | Always |
-| `ReadmeDev.md` | Developer reference doc. Architecture, entrypoints, commands, extension guide, known gaps. | When `AI_ENABLED = True` and API key is valid |
-
-Both files are written atomically (temp file + rename). They are excluded from the scan so they don't feed back into themselves.
-
----
-
-## What sumai skips
-
-Automatically excluded from the scan:
-
-- `node_modules`, `.git`, `__pycache__`, `.venv`, `dist`, `build`, and other standard noise dirs
-- Binary files, images, fonts, archives, compiled artifacts
-- Lock files (`package-lock.json`, `poetry.lock`, `yarn.lock`, etc.)
-- Secret-looking files (`.env`, `*.pem`, `id_rsa`, `secrets.*`)
-- Files over 300 KB
-
-Secrets inside included text files are redacted before being sent to the LLM (API keys, tokens, passwords, database URLs, private key blocks).
-
----
-
-## How to use the output
-
-**`CodebaseDump.md`** — treat as the full project context. Paste into any AI chat, or attach to prompts that need complete codebase awareness.
-
-**`ReadmeDev.md`** — treat as the authoritative developer reference for this project. Read it before answering architectural questions, planning changes, or onboarding to an unfamiliar codebase. It is grounded in actual code: if something isn't found in the repo, the doc says `Not found in provided context` rather than inventing details.
-
----
-
-## Pipeline internals (for debugging)
-
-```
-discover_project_files()     → git ls-files or filesystem walk
-inspect_project_files()      → read, binary-sniff, redact secrets
-render_dump()                → write CodebaseDump.md
-build_ai_context()           → select files by importance score, compact if needed
-[for each ArtifactSpec]
-  build_research_prompt()    → focused research prompt
-  call_ai()                  → LLM research pass
-build_readme_prompt()        → aggregator prompt with all research artifacts
-call_ai()                    → LLM aggregator pass
-atomic_write(ReadmeDev.md)   → final output
-shutil.rmtree(artifacts/)    → cleanup
-```
-
-Stage timings are tracked internally. On error, a placeholder `ReadmeDev.md` is written with the error message.
-
----
-
-## Freshness check
-
-Before using `ReadmeDev.md` as context, check if it's stale:
-
-```python
-import pathlib, os
-readme = pathlib.Path("ReadmeDev.md")
-if not readme.exists():
-    # run sumai
-    pass
-src_files = list(pathlib.Path(".").rglob("*.py"))
-if src_files and readme.stat().st_mtime < max(f.stat().st_mtime for f in src_files):
-    # ReadmeDev.md is older than newest source file — consider re-running sumai
-    pass
-```
-
----
-
-## Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `Unknown AI_MODEL_PRESET` error | Preset name misspelled | Check `MODEL_REGISTRY` for valid names |
-| `ReadmeDev.md` contains `AI_API_KEY is not configured` | Key not set | Set env var (e.g., `MISTRAL_API_KEY`) or `AI_API_KEY_OVERRIDE` |
-| `HTTP 401` in placeholder | Wrong or expired API key | Check key validity |
-| `ReadmeDev.md` is generic / invented | Context too large, compact mode triggered | Lower `AI_MAX_CONTEXT_CHARS` or reduce project size |
-| Only `CodebaseDump.md` written | `AI_ENABLED = False` | Set `AI_ENABLED = True` |
-| Script skips files you need | File matches exclusion rules | Check `EXCLUDED_DIR_NAMES`, `EXCLUDED_GLOBS` in config |
+Do not describe SumAI as an LLM tool or README generator. It only creates a deterministic codebase snapshot.
