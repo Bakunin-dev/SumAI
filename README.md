@@ -1,297 +1,151 @@
 # SumAI
 
-One file. Zero dependencies.
+A single-file, zero-dependency Python utility that turns a repository into a clean Markdown snapshot for AI-assisted review, onboarding, refactoring, and architecture analysis.
 
-Drop it into any project and generate:
+The current version is fully local and deterministic:
 
-- `CodebaseDump.md` — a clean codebase snapshot for AI chats, reviews, and refactors
-- `ReadmeDev.md` — a grounded developer doc generated from actual repository context
+- no AI or model API calls
+- no HTTP requests
+- no third-party Python packages
+- no generated summaries or ranking heuristics
 
-```bash
-python sumai.py
-````
-
-Built for the real world of AI tooling: small models, free providers, slow APIs, and strict rate limits.
-
-No pip install. No virtualenv. No config files. One Python file, standard library only.
-
----
-
-## Why this exists
-
-Most “AI documentation” workflows break down in practice:
-
-* they assume you want a heavy setup
-* they assume you always have access to a large paid model
-* they ignore the reality of low RPM / RPS free-tier providers
-* they produce vague summaries that feel detached from the actual codebase
-
-SumAI takes a simpler approach:
-
-* scan the repo
-* build a structured code snapshot
-* shape repository context carefully
-* optionally call an LLM
-* write a developer-facing doc that stays grounded in code
-
-The point is not “use the biggest model possible.”
-The point is to get useful output even when you are working with cheaper or free APIs.
-
----
-
-## What it does
-
-1. **Scans** your project — reads `.gitignore` / `.sumaiignore` patterns, skips binaries, redacts secrets
-2. **Writes `CodebaseDump.md`** — a full repository snapshot in one markdown file, ready for AI chats or archiving
-3. **Calls an LLM** (optional) — uses a two-pass pipeline: research pass → aggregator pass
-4. **Writes `ReadmeDev.md`** — a grounded developer reference doc: architecture, entrypoints, runtime flow, extension guide, known gaps
-
-This is designed to be practical, not flashy:
-the local Python side is lightweight, while the expensive part is the API call itself.
-
----
+It collects handwritten source code, documentation, schemas, and small important configuration files into one file named `snapcode_<project-folder>.md`.
 
 ## Quick start
 
+Copy `sumai.py` into the root of a project and run:
+
 ```bash
-# Set your API key
-export MISTRAL_API_KEY=your_key_here
-
-# Write both CodebaseDump.md and ReadmeDev.md (default)
-python sumai.py all --root /path/to/your/project
-
-# Write CodebaseDump.md only — no AI call, no API key needed
-python sumai.py dump --root /path/to/your/project
-
-# Write ReadmeDev.md only — AI call, dump not saved to disk
-python sumai.py readme --root /path/to/your/project
-
-# --root is optional if sumai.py is already in the project root
-cd /your/project && python sumai.py all
+python sumai.py
 ```
 
-**Output per command:**
+Or scan another directory:
+
+```bash
+python sumai.py --root /path/to/project
+```
+
+The result is written inside the scanned project directory:
 
 ```text
-dump   → CodebaseDump.md
-readme → ReadmeDev.md
-all    → CodebaseDump.md + ReadmeDev.md
+snapcode_<project-folder>.md
 ```
-
----
-
-## Model strategy
-
-SumAI is intentionally friendly to:
-
-* **free providers**
-* **cheap small models**
-* **slow API backends**
-* **low RPM / RPS limits**
-
-It does not assume you are running a premium model on every call.
-
-The project is structured so that useful output comes from:
-
-* repository filtering
-* context shaping
-* grounded prompts
-* small-model-compatible workflows
-
-In many cases, a good small model is enough.
-
-If you care about speed, cost, and not slamming provider limits, the default path should usually be a smaller model, not a giant one.
-
----
-
-## AI Model Router
-
-sumai uses a typed preset system. Most users only need one line:
-
-```python
-# Choose a preset (default: mistral_small)
-AI_MODEL_PRESET = "mistral_small"
-```
-
-### Built-in presets
-
-| Preset          | Provider | Protocol         | Model              |
-| --------------- | -------- | ---------------- | ------------------ |
-| `mistral_small` | Mistral  | chat_completions | mistral-small-2603 |
-| `glm_flash`     | Z.ai     | chat_completions | glm-4.7-flash      |
-| `openai_gpt5`   | OpenAI   | responses        | gpt-5              |
-
-### Recommended usage
-
-* **`mistral_small`** — the default recommendation for most users; fast enough, cheap enough, practical enough
-* **`glm_flash`** — useful when you want a free-tier style workflow
-* **`openai_gpt5`** — higher-end option when you care more about output quality than speed or cost
-
-SumAI is not built around the assumption that bigger models are always the right answer.
-For this workflow, a smaller model with well-shaped context is often the better tradeoff.
-
-### Why small and free models matter here
-
-This project is designed around a practical constraint:
-API latency is often worse than the local script runtime.
-
-That means the real bottleneck is usually:
-
-* provider response time
-* rate limits
-* free-tier throughput
-
-Not Python execution.
-
-So the tool is intentionally conservative:
-
-* it can run without AI at all
-* it keeps the local side simple
-* it supports cheaper and free providers natively
-* it spaces requests instead of aggressively hammering APIs
-* it tries to stay usable under weak provider conditions
-
-### Add your own model
-
-One entry in `MODEL_REGISTRY`:
-
-```python
-MODEL_REGISTRY["my_model"] = ModelSpec(
-    provider_name="my_model",
-    protocol="chat_completions",        # or "responses"
-    base_url="https://api.example.com/v1",
-    model="my-model-name",
-    env_keys=("MY_API_KEY", "AI_API_KEY"),
-)
-```
-
-Then set:
-
-```python
-AI_MODEL_PRESET = "my_model"
-```
-
-### Override mode
-
-Override any preset value without changing the registry:
-
-```python
-AI_MODEL_PRESET = "mistral_small"
-AI_MODEL_OVERRIDE = "mistral-small-latest"      # use different model
-AI_BASE_URL_OVERRIDE = "https://my-proxy.com/v1" # custom endpoint
-AI_API_KEY_OVERRIDE = "sk-..."                  # hardcoded key (not recommended)
-```
-
-Set `AI_ENABLED = False` to skip the LLM call and only generate `CodebaseDump.md`.
-
----
-
-## Rate limits and free-tier reality
-
-SumAI does not pretend free APIs behave like premium infrastructure.
-
-It is built to tolerate the annoying stuff:
-
-* low requests per minute
-* low requests per second
-* occasional `429` responses
-* providers that answer in a few seconds on small models and much longer on larger ones
-
-That is why the project favors:
-
-* fewer AI calls over more orchestration
-* compact repository context when needed
-* a simple two-pass flow instead of a sprawling agent graph
-* a default small-model path that is actually usable
-
-If your provider is slow, that is usually a provider-side latency problem, not a sign that the local scanner is bloated.
-
----
-
-## What gets skipped
-
-sumai automatically ignores:
-
-* `.git`, `node_modules`, `__pycache__`, `.venv`, `dist`, `build`, and other standard noise dirs
-* Binary files, images, fonts, archives, compiled artifacts
-* Lock files (`package-lock.json`, `poetry.lock`, etc.)
-* Secret-looking files (`.env`, `*.pem`, `id_rsa`, etc.)
-* Files over 300 KB
-
-Secrets inside text files are redacted before being sent to the LLM:
-
-* API keys
-* tokens
-* passwords
-* private key blocks
-
----
 
 ## Commands
 
-| Command  | AI call | CodebaseDump.md | ReadmeDev.md |
-| -------- | ------- | --------------- | ------------ |
-| `all`    | ✅       | ✅               | ✅            |
-| `dump`   | ❌       | ✅               | ❌            |
-| `readme` | ✅       | ❌               | ✅            |
+```bash
+# Scan the directory containing sumai.py
+python sumai.py
 
-### `dump`
+# Scan a specific project
+python sumai.py --root /path/to/project
 
-Useful for:
+# Choose the output filename
+python sumai.py --output repository_context.md
 
-* pasting the codebase into Claude / ChatGPT / Gemini manually
-* code reviews and onboarding
-* archiving a snapshot before a big refactor
-* working with no API key at all
+# Explain every include/skip decision in the generated dump
+python sumai.py --explain
 
-### `readme`
+# Include package-manager lockfiles
+python sumai.py --include-lockfiles
 
-Useful when you want to regenerate the developer doc without overwriting an existing dump.
+# Include generated files that pass the remaining checks
+python sumai.py --include-generated
 
-### `all`
+# Include generic JSON/YAML/TOML/INI/CFG files, not only important configs
+python sumai.py --include-all-configs
+```
 
-Useful when you want the full workflow in one run.
+Options can be combined:
 
----
+```bash
+python sumai.py \
+  --root /path/to/project \
+  --output project_context.md \
+  --explain \
+  --include-lockfiles
+```
 
-## For AI agents (Claude Code, Cursor, etc.)
+## What is included
 
-See [`SKILL.md`](./SKILL.md) — a machine-readable description of what sumai does and when to invoke it, designed for AI coding agents.
+By default, SumAI keeps files that are useful for understanding a codebase:
 
----
+- source code across common programming languages
+- Markdown, MDX, reStructuredText, and AsciiDoc documentation
+- schemas such as GraphQL, Protocol Buffers, Prisma, SQL, JSON Schema, and Avro
+- important project configuration such as `pyproject.toml`, `package.json`, Docker files, CI workflows, and common build configs
+- selected manual text files such as `README`, `LICENSE`, `CHANGELOG`, `help.txt`, and `usage.txt`
+- environment templates such as `.env.example`, with secret-aware redaction
 
-## What `ReadmeDev.md` contains
+The generated Markdown contains:
 
-The generated developer doc covers:
+1. generation metadata and scan statistics
+2. a repository tree
+3. the included files in language-tagged code fences
+4. a list of skipped files and reasons
+5. optional per-file decisions when `--explain` is enabled
 
-* project skeleton and directory guide
-* stack, tooling, test setup, ops signals
-* entrypoints and runtime flow
-* architecture layers and module relationships
-* core data and domain model
-* key commands and verification steps
-* architectural invariants and safety boundaries
-* configuration and environment
-* extension guide
-* known gaps and technical debt
+## What is skipped
 
-Everything is meant to stay grounded in actual repository evidence.
-If something is not clearly present in the repo, the generated doc should say so instead of inventing details.
+The default policy excludes common noise and risky content, including:
 
----
+- `.git`, virtual environments, caches, build output, dependencies, IDE state, and generated artifact directories
+- images, media, archives, office documents, databases, model weights, compiled files, and other binary/data formats
+- `.env`, credentials files, private keys, and secret-looking filenames
+- package-manager lockfiles unless `--include-lockfiles` is used
+- generated files unless `--include-generated` is used
+- generic configuration files that are not recognized as important, unless `--include-all-configs` is used
+- oversized files and content beyond the final dump size limit
+- older SumAI/CodebaseDump context artifacts, preventing recursive dumps
+
+Text content is additionally checked for common API keys, tokens, passwords, credential-bearing URLs, and private-key blocks. Detected values are replaced with redaction markers before output.
+
+## Discovery behavior
+
+When the target is inside a Git repository and Git is available, SumAI uses `git ls-files` to discover tracked and unignored files. Otherwise, it falls back to a filesystem scan.
+
+Ignore patterns are read from:
+
+- `.codebasedumpignore`
+- `.sumaiignore`
+- `.ignore`
+- `.gitignore`
+
+The built-in ignore parser intentionally supports a portable subset of gitignore syntax: comments, blank lines, directory patterns, and `fnmatch`-style globs. Negated `!` patterns are ignored.
+
+## Safety limits
+
+The script uses conservative limits to avoid accidentally producing enormous context files:
+
+- separate per-file limits for code, docs, configs, schemas, and text
+- a maximum of 25,000 discovered files
+- a final dump cap of 5 MB
+- binary sniffing before decoding file contents
+- atomic output writes through a temporary file
+
+Files rejected by these limits remain visible in the skipped-files section.
 
 ## Requirements
 
-* Python 3.10+
-* an API key for your chosen LLM provider, only if `AI_ENABLED = True`
+- Python 3.10 or newer
+- Git is optional but recommended for repository-aware discovery
 
-That’s it.
+No installation step is required:
 
----
+```bash
+git clone https://github.com/Bakunin-dev/SumAI.git
+cd SumAI
+python sumai.py --root /path/to/project
+```
+
+## Typical uses
+
+- paste a grounded repository snapshot into ChatGPT, Claude, Gemini, or another coding assistant
+- prepare context for a code review or refactor
+- create an onboarding artifact for a new developer
+- inspect which files enter an AI context and why
+- archive a readable codebase snapshot without external services
 
 ## License
 
 MIT
-
-```
-```
